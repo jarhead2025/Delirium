@@ -1,0 +1,335 @@
+// PSF Bone Animation Compute Shader
+// Computes bone transformations for skeletal animation on GPU
+// Place this file at: Assets/Resources/PSF/Shaders/PSFBoneAnimation.compute
+
+#pragma kernel CSMain
+
+#define THREAD_GROUP_SIZE 64
+
+// Bone data structure (must match C# exactly - 64 bytes)
+struct BoneBuffer
+{
+    uint parent_bone_index;          // 4 bytes
+    uint child_bone_index;           // 4 bytes
+    uint3 pos_xyz_packed;            // 6 bytes packed as 3x uint16 in 2 uints
+    uint orientation;                // 4 bytes
+    float3 ang_velocity;             // 12 bytes
+    float3 ang_accel;                // 12 bytes
+    float2 physical_params;          // 8 bytes
+    uint flags;                      // 1 byte + 3 bytes padding
+    // Total: 64 bytes with padding
+};
+
+// Input/Output buffers
+StructuredBuffer<BoneBuffer> _BoneBuffer;
+RWStructuredBuffer<float4x4> _BoneMatrixBuffer;
+
+// Shader parameters
+float _AnimationTime;
+float _AnimationSpeed;
+float _DeltaTime;
+float _Time;
+int _BoneCount;
+
+// Utility functions
+float3 UnpackPosition(uint3 packed)
+{
+    // Extract uint16 values from packed data
+    uint x = (packed.x & 0xFFFF);
+    uint y = (packed.x >> 16);
+    uint z = (packed.y & 0xFFFF);
+    
+    // Convert to normalized coordinates
+    float3 pos;
+    pos.x = ((float)x - 32768.0) / 32768.0 * 1.8;
+    pos.y = ((float)y - 32768.0) / 32768.0 * 1.8;
+    pos.z = ((float)z - 32768.0) / 32768.0 * 1.8;
+    
+    return pos;
+}
+
+float4 UnpackOrientation(uint packed)
+{
+    // Simple orientation unpacking - could be enhanced for quaternions
+    float angle = ((float)packed / 4294967295.0) * 6.28318; // 0 to 2π
+    
+    // Convert to quaternion around Y axis for simplicity
+    float halfAngle = angle * 0.5;
+    return float4(0, sin(halfAngle), 0, cos(halfAngle));
+}
+
+float4x4 QuaternionToMatrix(float4 q)
+{
+    float4x4 m;
+    
+    float xx = q.x * q.x;
+    float yy = q.y * q.y;
+    float zz = q.z * q.z;
+    float xy = q.x * q.y;
+    float xz = q.x * q.z;
+    float yz = q.y * q.z;
+    float wx = q.w * q.x;
+    float wy = q.w * q.y;
+    float wz = q.w * q.z;
+    
+    m[0][0] = 1.0 - 2.0 * (yy + zz);
+    m[0][1] = 2.0 * (xy + wz);
+    m[0][2] = 2.0 * (xz - wy);
+    m[0][3] = 0.0;
+    
+    m[1][0] = 2.0 * (xy - wz);
+    m[1][1] = 1.0 - 2.0 * (xx + zz);
+    m[1][2] = 2.0 * (yz + wx);
+    m[1][3] = 0.0;
+    
+    m[2][0] = 2.0 * (xz + wy);
+    m[2][1] = 2.0 * (yz - wx);
+    m[2][2] = 1.0 - 2.0 * (xx + yy);
+    m[2][3] = 0.0;
+    
+    m[3][0] = 0.0;
+    m[3][1] = 0.0;
+    m[3][2] = 0.0;
+    m[3][3] = 1.0;
+    
+    return m;
+}
+
+float4x4 CreateTransformMatrix(float3 position, float4 rotation, float3 scale)
+{
+    float4x4 rotMatrix = QuaternionToMatrix(rotation);
+    
+    // Apply scale
+    rotMatrix[0] *= scale.x;
+    rotMatrix[1] *= scale.y;
+    rotMatrix[2] *= scale.z;
+    
+    // Apply translation
+    rotMatrix[3][0] = position.x;
+    rotMatrix[3][1] = position.y;
+    rotMatrix[3][2] = position.z;
+    
+    return rotMatrix;
+}
+
+// Animation functions
+float3 EvaluatePositionAnimation(BoneBuffer bone, float time, float3 basePos)
+{
+    float3 animatedPos = basePos;
+    
+    // Simple sinusoidal movement based on bone properties
+    float frequency = bone.physical_params.x;
+    float amplitude = bone.physical_params.y;
+    
+    if (frequency > 0.0)
+    {
+        float wave = sin(time * frequency * 6.28318);
+        animatedPos += float3(0, wave * amplitude * 0.1, 0);
+    }
+    
+    // Add some rotation-based movement
+    float3 rotMovement = float3(
+        sin(time * 2.0 + basePos.x) * 0.05,
+        cos(time * 1.5 + basePos.y) * 0.03,
+        sin(time * 3.0 + basePos.z) * 0.02
+    );
+    
+    animatedPos += rotMovement * amplitude;
+    
+    return animatedPos;
+}
+
+float4 EvaluateRotationAnimation(BoneBuffer bone, float time, float4 baseRotation)
+{
+    float3 angVel = bone.ang_velocity;
+    float3 angAccel = bone.ang_accel;
+    
+    // Calculate accumulated rotation based on angular velocity and acceleration
+    float3 totalRotation = angVel * time + 0.5 * angAccel * time * time;
+    
+    // Convert to quaternion increments
+    float3 axis = normalize(totalRotation);
+    float angle = length(totalRotation);
+    
+    if (angle > 0.001)
+    {
+        float halfAngle = angle * 0.5;
+        float4 deltaRotation = float4(
+            axis * sin(halfAngle),
+            cos(halfAngle)
+        );
+        
+        // Combine with base rotation
+        // Simplified quaternion multiplication
+        float4 result;
+        result.w = baseRotation.w * deltaRotation.w - dot(baseRotation.xyz, deltaRotation.xyz);
+        result.xyz = baseRotation.w * deltaRotation.xyz + deltaRotation.w * baseRotation.xyz + cross(baseRotation.xyz, deltaRotation.xyz);
+        
+        return normalize(result);
+    }
+    
+    return baseRotation;
+}
+
+float3 EvaluateScaleAnimation(BoneBuffer bone, float time)
+{
+    // Simple breathing/pulsing animation
+    float pulse = 1.0 + sin(time * 4.0) * 0.1 * bone.physical_params.y;
+    return float3(pulse, pulse, pulse);
+}
+
+// Physics simulation
+float3 ApplyPhysics(BoneBuffer bone, float3 currentPos, float3 velocity, float deltaTime)
+{
+    // Simple physics integration
+    float mass = bone.physical_params.x;
+    float damping = bone.physical_params.y;
+    
+    if (mass > 0.0)
+    {
+        // Apply gravity
+        float3 gravity = float3(0, -9.81, 0);
+        float3 force = gravity * mass;
+        
+        // Apply damping
+        velocity *= (1.0 - damping * deltaTime);
+        
+        // Integrate
+        velocity += (force / mass) * deltaTime;
+        currentPos += velocity * deltaTime;
+    }
+    
+    return currentPos;
+}
+
+// Hierarchical bone processing
+void ProcessBoneHierarchy(uint boneIndex, float time, float deltaTime)
+{
+    if (boneIndex >= (uint)_BoneCount)
+        return;
+    
+    BoneBuffer bone = _BoneBuffer[boneIndex];
+    
+    // Get base transformation
+    float3 basePos = UnpackPosition(bone.pos_xyz_packed);
+    float4 baseRotation = UnpackOrientation(bone.orientation);
+    float3 baseScale = float3(1, 1, 1);
+    
+    // Apply animation
+    float3 animatedPos = EvaluatePositionAnimation(bone, time, basePos);
+    float4 animatedRotation = EvaluateRotationAnimation(bone, time, baseRotation);
+    float3 animatedScale = EvaluateScaleAnimation(bone, time);
+    
+    // Apply physics if enabled (check flags)
+    if ((bone.flags & 0x1) != 0) // Physics enabled flag
+    {
+        // Simple physics would require previous frame data - simplified for now
+        float3 velocity = bone.ang_velocity; // Reuse as velocity for simplicity
+        animatedPos = ApplyPhysics(bone, animatedPos, velocity, deltaTime);
+    }
+    
+    // Create transformation matrix
+    float4x4 boneMatrix = CreateTransformMatrix(animatedPos, animatedRotation, animatedScale);
+    
+    // Handle parent hierarchy
+    if (bone.parent_bone_index != 0xFFFFFFFF && bone.parent_bone_index < (uint)_BoneCount)
+    {
+        // Get parent matrix
+        float4x4 parentMatrix = _BoneMatrixBuffer[bone.parent_bone_index];
+        
+        // Combine with parent transformation
+        boneMatrix = mul(parentMatrix, boneMatrix);
+    }
+    
+    // Store result
+    _BoneMatrixBuffer[boneIndex] = boneMatrix;
+}
+
+// Constraint system
+void ApplyBoneConstraints(uint boneIndex)
+{
+    if (boneIndex >= (uint)_BoneCount)
+        return;
+    
+    BoneBuffer bone = _BoneBuffer[boneIndex];
+    float4x4 currentMatrix = _BoneMatrixBuffer[boneIndex];
+    
+    // Extract current position from matrix
+    float3 currentPos = float3(currentMatrix[3][0], currentMatrix[3][1], currentMatrix[3][2]);
+    
+    // Apply position constraints
+    if ((bone.flags & 0x2) != 0) // Position constraint flag
+    {
+        // Clamp to reasonable bounds
+        currentPos = clamp(currentPos, float3(-10, -10, -10), float3(10, 10, 10));
+        
+        // Update matrix
+        currentMatrix[3][0] = currentPos.x;
+        currentMatrix[3][1] = currentPos.y;
+        currentMatrix[3][2] = currentPos.z;
+    }
+    
+    // Apply rotation constraints
+    if ((bone.flags & 0x4) != 0) // Rotation constraint flag
+    {
+        // Extract rotation and clamp if needed
+        // This is simplified - real implementation would extract quaternion and apply limits
+        float4x4 identity = float4x4(
+            1, 0, 0, 0,
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+            currentPos.x, currentPos.y, currentPos.z, 1
+        );
+        
+        // Blend towards identity to limit rotation
+        float constraintStrength = 0.1;
+        currentMatrix = lerp(currentMatrix, identity, constraintStrength);
+    }
+    
+    _BoneMatrixBuffer[boneIndex] = currentMatrix;
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    uint boneIndex = id.x;
+    
+    if (boneIndex >= (uint)_BoneCount)
+        return;
+    
+    // Process bone animation
+    ProcessBoneHierarchy(boneIndex, _AnimationTime, _DeltaTime);
+    
+    // Apply constraints
+    ApplyBoneConstraints(boneIndex);
+    
+    // Ensure the matrix is valid
+    float4x4 finalMatrix = _BoneMatrixBuffer[boneIndex];
+    
+    // Check for NaN/Inf and replace with identity if invalid
+    bool isValid = true;
+    for (int i = 0; i < 4; i++)
+    {
+        for (int j = 0; j < 4; j++)
+        {
+            if (!isfinite(finalMatrix[i][j]))
+            {
+                isValid = false;
+                break;
+            }
+        }
+        if (!isValid) break;
+    }
+    
+    if (!isValid)
+    {
+        finalMatrix = float4x4(
+            1, 0, 0, 0,
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+            0, 0, 0, 1
+        );
+    }
+    
+    _BoneMatrixBuffer[boneIndex] = finalMatrix;
+}

@@ -1,0 +1,612 @@
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using Unity.Collections;
+using Unity.Jobs;
+using Unity.Mathematics;
+using UnityEngine;
+using UnityEngine.Rendering;
+
+namespace ProceduralSurface.Unity
+{
+    // =============================================================================
+    // CORE PSF DATA STRUCTURES (matching C++ implementation)
+    // =============================================================================
+    
+    [StructLayout(LayoutKind.Sequential, Size = 64)]
+    public struct ProceduralSurfaceBuffer
+    {
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4)]
+        public ushort[] anchor_point_indices;
+        public ushort surface_definition_index;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)]
+        public float[] eqn_params;
+        public byte secondary_surface_type;
+        public byte combination_param;
+        public byte deformation_strength;
+        public byte animation_param;
+        public byte color_eqn_r, color_param_r;
+        public byte color_eqn_g, color_param_g;
+        public byte color_eqn_b, color_param_b;
+        public byte roughness;
+        public byte metallic;
+        public byte emissive_strength;
+        public byte specular_tint;
+        public byte normal_mode;
+        public byte lod_bias;
+        public byte surface_modifiers;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 5)]
+        public byte[] reserved;
+    }
+
+    [StructLayout(LayoutKind.Sequential, Size = 64)]
+    public struct AnchorPointBuffer
+    {
+        public uint bone_index;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4)]
+        public ushort[] connected_anchors;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4)]
+        public byte[] curve_types;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
+        public byte[] curve_params;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 3)]
+        public ushort[] pos_xyz;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 3)]
+        public short[] delta_xyz;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 3)]
+        public byte[] normal;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 2)]
+        public byte[] tangent_u;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 2)]
+        public byte[] tangent_v;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 3)]
+        public byte[] color;
+        public byte roughness;
+        public byte metallic;
+        public byte anim_weight;
+        public byte curvature_u;
+        public byte curvature_v;
+        public byte continuity_flags;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4)]
+        public byte[] reserved;
+    }
+
+    [StructLayout(LayoutKind.Sequential, Size = 64)]
+    public struct BoneBuffer
+    {
+        public uint parent_bone_index;
+        public uint child_bone_index;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 3)]
+        public ushort[] pos_xyz;
+        public uint orientation;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 3)]
+        public float[] ang_velocity;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 3)]
+        public float[] ang_accel;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 2)]
+        public float[] physical_params;
+        public byte flags;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 13)]
+        public byte[] reserved;
+    }
+
+    // =============================================================================
+    // UNITY PROCEDURAL OBJECT COMPONENT
+    // =============================================================================
+    
+    [System.Serializable]
+    public class PSFObject : MonoBehaviour
+    {
+        [Header("PSF Data")]
+        public TextAsset psfAsset;
+        
+        [Header("Rendering")]
+        public Material proceduralMaterial;
+        public int pointsPerSurface = 100;
+        public float pointSize = 0.02f;
+        
+        [Header("Animation")]
+        public bool enableAnimation = true;
+        public float animationSpeed = 1.0f;
+        public AnimationCurve animationCurve = AnimationCurve.Linear(0, 0, 1, 1);
+        
+        [Header("Physics")]
+        public bool enableDynamicColliders = true;
+        public PhysicMaterial physicMaterial;
+        
+        [Header("Performance")]
+        public int maxLODLevel = 3;
+        public float lodDistance = 10.0f;
+        
+        // Runtime data
+        private PSFCollection psfCollection;
+        private NativeArray<float3> generatedPoints;
+        private NativeArray<Color> generatedColors;
+        private ComputeBuffer pointBuffer;
+        private ComputeBuffer colorBuffer;
+        private JobHandle currentJob;
+        private float animationTime;
+        private int currentLOD = 0;
+        
+        // Component references
+        private MeshCollider dynamicCollider;
+        private Mesh dynamicMesh;
+        
+        void Start()
+        {
+            LoadPSFData();
+            InitializeRendering();
+            InitializePhysics();
+        }
+        
+        void Update()
+        {
+            UpdateAnimation();
+            UpdateLOD();
+            UpdateRendering();
+            UpdatePhysics();
+        }
+        
+        void OnDestroy()
+        {
+            CleanupResources();
+        }
+        
+        private void LoadPSFData()
+        {
+            if (psfAsset != null)
+            {
+                psfCollection = PSFLoader.LoadFromBytes(psfAsset.bytes);
+                Debug.Log($"Loaded PSF: {psfCollection.surfaces.Length} surfaces, {psfCollection.anchors.Length} anchors");
+            }
+        }
+        
+        private void InitializeRendering()
+        {
+            if (psfCollection == null) return;
+            
+            int totalPoints = psfCollection.surfaces.Length * pointsPerSurface;
+            generatedPoints = new NativeArray<float3>(totalPoints, Allocator.Persistent);
+            generatedColors = new NativeArray<Color>(totalPoints, Allocator.Persistent);
+            
+            pointBuffer = new ComputeBuffer(totalPoints, 12); // float3
+            colorBuffer = new ComputeBuffer(totalPoints, 16); // Color
+        }
+        
+        private void InitializePhysics()
+        {
+            if (enableDynamicColliders)
+            {
+                dynamicCollider = gameObject.GetComponent<MeshCollider>() ?? gameObject.AddComponent<MeshCollider>();
+                dynamicMesh = new Mesh();
+                dynamicCollider.sharedMesh = dynamicMesh;
+                dynamicCollider.material = physicMaterial;
+            }
+        }
+        
+        private void UpdateAnimation()
+        {
+            if (enableAnimation)
+            {
+                animationTime += Time.deltaTime * animationSpeed;
+                if (animationTime > 1.0f) animationTime -= 1.0f;
+            }
+        }
+        
+        private void UpdateLOD()
+        {
+            Camera mainCamera = Camera.main;
+            if (mainCamera != null)
+            {
+                float distance = Vector3.Distance(transform.position, mainCamera.transform.position);
+                currentLOD = Mathf.Clamp(Mathf.FloorToInt(distance / lodDistance), 0, maxLODLevel);
+            }
+        }
+        
+        private void UpdateRendering()
+        {
+            if (psfCollection == null || !generatedPoints.IsCreated) return;
+            
+            // Complete previous job
+            currentJob.Complete();
+            
+            // Start new point generation job
+            var job = new PSFPointGenerationJob
+            {
+                surfaces = psfCollection.surfaces,
+                anchors = psfCollection.anchors,
+                bones = psfCollection.bones,
+                outputPoints = generatedPoints,
+                outputColors = generatedColors,
+                animationTime = animationTime,
+                lodLevel = currentLOD,
+                pointsPerSurface = pointsPerSurface / (1 << currentLOD), // Reduce points for higher LOD
+                animationCurve = animationCurve
+            };
+            
+            currentJob = job.Schedule(psfCollection.surfaces.Length, 1);
+            
+            // Update GPU buffers after job completes
+            JobHandle.ScheduleBatchedJobs();
+            currentJob.Complete();
+            
+            pointBuffer.SetData(generatedPoints);
+            colorBuffer.SetData(generatedColors);
+            
+            // Render using Graphics.DrawProcedural or custom shader
+            RenderProceduralPoints();
+        }
+        
+        private void UpdatePhysics()
+        {
+            if (enableDynamicColliders && dynamicMesh != null && generatedPoints.IsCreated)
+            {
+                // Generate simplified collision mesh from points
+                UpdateCollisionMesh();
+            }
+        }
+        
+        private void RenderProceduralPoints()
+        {
+            if (proceduralMaterial != null)
+            {
+                proceduralMaterial.SetBuffer("_Points", pointBuffer);
+                proceduralMaterial.SetBuffer("_Colors", colorBuffer);
+                proceduralMaterial.SetFloat("_PointSize", pointSize);
+                proceduralMaterial.SetMatrix("_ObjectToWorld", transform.localToWorldMatrix);
+                
+                Graphics.DrawProcedural(proceduralMaterial, 
+                    new Bounds(transform.position, Vector3.one * 10),
+                    MeshTopology.Points, generatedPoints.Length);
+            }
+        }
+        
+        private void UpdateCollisionMesh()
+        {
+            // Simplified: Convert points to triangulated mesh for collision
+            // In practice, you'd want a more sophisticated mesh generation algorithm
+            var vertices = new Vector3[generatedPoints.Length];
+            for (int i = 0; i < generatedPoints.Length; i++)
+            {
+                vertices[i] = generatedPoints[i];
+            }
+            
+            dynamicMesh.Clear();
+            dynamicMesh.vertices = vertices;
+            // Generate triangles using Delaunay triangulation or convex hull
+            dynamicMesh.RecalculateNormals();
+            dynamicMesh.RecalculateBounds();
+        }
+        
+        private void CleanupResources()
+        {
+            currentJob.Complete();
+            
+            if (generatedPoints.IsCreated) generatedPoints.Dispose();
+            if (generatedColors.IsCreated) generatedColors.Dispose();
+            if (pointBuffer != null) pointBuffer.Release();
+            if (colorBuffer != null) colorBuffer.Release();
+        }
+    }
+
+    // =============================================================================
+    // JOB SYSTEM FOR POINT GENERATION
+    // =============================================================================
+    
+    [Unity.Collections.LowLevel.Unsafe.BurstCompile]
+    public struct PSFPointGenerationJob : IJobParallelFor
+    {
+        [ReadOnly] public NativeArray<ProceduralSurfaceBuffer> surfaces;
+        [ReadOnly] public NativeArray<AnchorPointBuffer> anchors;
+        [ReadOnly] public NativeArray<BoneBuffer> bones;
+        
+        [WriteOnly] public NativeArray<float3> outputPoints;
+        [WriteOnly] public NativeArray<Color> outputColors;
+        
+        [ReadOnly] public float animationTime;
+        [ReadOnly] public int lodLevel;
+        [ReadOnly] public int pointsPerSurface;
+        [ReadOnly] public AnimationCurve animationCurve;
+        
+        public void Execute(int surfaceIndex)
+        {
+            var surface = surfaces[surfaceIndex];
+            int baseIndex = surfaceIndex * pointsPerSurface;
+            
+            // Get surface anchor points
+            var anchor0 = anchors[surface.anchor_point_indices[0]];
+            var anchor1 = anchors[surface.anchor_point_indices[1]];
+            var anchor2 = anchors[surface.anchor_point_indices[2]];
+            var anchor3 = anchors[surface.anchor_point_indices[3]];
+            
+            // Apply bone transformations
+            float3 pos0 = ApplyBoneTransform(anchor0, bones, animationTime);
+            float3 pos1 = ApplyBoneTransform(anchor1, bones, animationTime);
+            float3 pos2 = ApplyBoneTransform(anchor2, bones, animationTime);
+            float3 pos3 = ApplyBoneTransform(anchor3, bones, animationTime);
+            
+            // Generate points across surface using mathematical interpolation
+            int pointsPerRow = (int)math.sqrt(pointsPerSurface);
+            for (int i = 0; i < pointsPerSurface; i++)
+            {
+                int row = i / pointsPerRow;
+                int col = i % pointsPerRow;
+                
+                float u = (float)col / (pointsPerRow - 1);
+                float v = (float)row / (pointsPerRow - 1);
+                
+                // Bilinear interpolation of positions
+                float3 top = math.lerp(pos0, pos1, u);
+                float3 bottom = math.lerp(pos3, pos2, u);
+                float3 finalPos = math.lerp(top, bottom, v);
+                
+                // Apply surface equation deformation
+                finalPos += EvaluateSurfaceEquation(surface, u, v, animationTime);
+                
+                // Evaluate mathematical color
+                Color color = EvaluateMathematicalColor(surface, u, v, animationTime);
+                
+                outputPoints[baseIndex + i] = finalPos;
+                outputColors[baseIndex + i] = color;
+            }
+        }
+        
+        private float3 ApplyBoneTransform(AnchorPointBuffer anchor, NativeArray<BoneBuffer> bones, float time)
+        {
+            // Decode position from anchor
+            float3 basePos = new float3(
+                (anchor.pos_xyz[0] - 32768) / 32768.0f * 1.8f,
+                (anchor.pos_xyz[1] - 32768) / 32768.0f * 1.8f,
+                (anchor.pos_xyz[2] - 32768) / 32768.0f * 1.8f
+            );
+            
+            if (anchor.bone_index < bones.Length)
+            {
+                var bone = bones[anchor.bone_index];
+                
+                // Simple rotation animation based on bone angular velocity
+                float3 rotation = new float3(bone.ang_velocity[0], bone.ang_velocity[1], bone.ang_velocity[2]) * time;
+                
+                // Apply rotation transform (simplified)
+                return basePos + math.sin(rotation * 0.5f) * 0.1f;
+            }
+            
+            return basePos;
+        }
+        
+        private float3 EvaluateSurfaceEquation(ProceduralSurfaceBuffer surface, float u, float v, float time)
+        {
+            // Implement mathematical surface equations based on surface type
+            switch (surface.secondary_surface_type)
+            {
+                case 0: // Plane
+                    return float3.zero;
+                    
+                case 1: // Sine wave
+                    return new float3(0, math.sin(u * math.PI * 2 + time * 2) * 0.1f, 0);
+                    
+                case 2: // Bezier patch
+                    float height = surface.eqn_params[0] * u * v + surface.eqn_params[1] * (1-u) * v;
+                    return new float3(0, height * 0.2f, 0);
+                    
+                default:
+                    return float3.zero;
+            }
+        }
+        
+        private Color EvaluateMathematicalColor(ProceduralSurfaceBuffer surface, float u, float v, float time)
+        {
+            float r = EvaluateColorChannel(surface.color_eqn_r, surface.color_param_r, u, v, time);
+            float g = EvaluateColorChannel(surface.color_eqn_g, surface.color_param_g, u, v, time);
+            float b = EvaluateColorChannel(surface.color_eqn_b, surface.color_param_b, u, v, time);
+            
+            return new Color(r, g, b, 1.0f);
+        }
+        
+        private float EvaluateColorChannel(byte equation, byte param, float u, float v, float time)
+        {
+            float paramFloat = param / 255.0f;
+            
+            switch (equation)
+            {
+                case 0: // Constant
+                    return paramFloat;
+                case 1: // Linear U
+                    return paramFloat * u;
+                case 2: // Linear V
+                    return paramFloat * v;
+                case 3: // Bilinear
+                    return paramFloat * u * v;
+                case 4: // Sine wave (animated)
+                    return paramFloat * (0.5f + 0.5f * math.sin(u * math.PI * 2 + time * math.PI));
+                default:
+                    return paramFloat;
+            }
+        }
+    }
+
+    // =============================================================================
+    // PSF ASSET LOADER
+    // =============================================================================
+    
+    public static class PSFLoader
+    {
+        public static PSFCollection LoadFromBytes(byte[] data)
+        {
+            // Implement binary reading logic matching C++ format
+            var collection = new PSFCollection();
+            
+            using (var stream = new System.IO.MemoryStream(data))
+            using (var reader = new System.IO.BinaryReader(stream))
+            {
+                // Read header
+                uint magic = reader.ReadUInt32();
+                if (magic != 0x00465350) // "PSF\0"
+                    throw new System.Exception("Invalid PSF file format");
+                
+                uint version = reader.ReadUInt32();
+                uint objectCount = reader.ReadUInt32();
+                uint bonePoolSize = reader.ReadUInt32();
+                uint anchorPoolSize = reader.ReadUInt32();
+                uint surfacePoolSize = reader.ReadUInt32();
+                uint metadataSize = reader.ReadUInt32();
+                
+                // Skip remaining header fields
+                stream.Position = 64; // Header is exactly 64 bytes
+                
+                // Skip metadata for now
+                stream.Position += metadataSize;
+                
+                // Read bone pool
+                collection.bones = new NativeArray<BoneBuffer>((int)bonePoolSize, Allocator.Persistent);
+                for (int i = 0; i < bonePoolSize; i++)
+                {
+                    collection.bones[i] = ReadBoneBuffer(reader);
+                }
+                
+                // Read anchor pool
+                collection.anchors = new NativeArray<AnchorPointBuffer>((int)anchorPoolSize, Allocator.Persistent);
+                for (int i = 0; i < anchorPoolSize; i++)
+                {
+                    collection.anchors[i] = ReadAnchorBuffer(reader);
+                }
+                
+                // Read surface pool
+                collection.surfaces = new NativeArray<ProceduralSurfaceBuffer>((int)surfacePoolSize, Allocator.Persistent);
+                for (int i = 0; i < surfacePoolSize; i++)
+                {
+                    collection.surfaces[i] = ReadSurfaceBuffer(reader);
+                }
+            }
+            
+            return collection;
+        }
+        
+        private static BoneBuffer ReadBoneBuffer(System.IO.BinaryReader reader)
+        {
+            var bone = new BoneBuffer();
+            bone.parent_bone_index = reader.ReadUInt32();
+            bone.child_bone_index = reader.ReadUInt32();
+            bone.pos_xyz = new ushort[3];
+            for (int i = 0; i < 3; i++) bone.pos_xyz[i] = reader.ReadUInt16();
+            bone.orientation = reader.ReadUInt32();
+            bone.ang_velocity = new float[3];
+            for (int i = 0; i < 3; i++) bone.ang_velocity[i] = reader.ReadSingle();
+            bone.ang_accel = new float[3];
+            for (int i = 0; i < 3; i++) bone.ang_accel[i] = reader.ReadSingle();
+            bone.physical_params = new float[2];
+            for (int i = 0; i < 2; i++) bone.physical_params[i] = reader.ReadSingle();
+            bone.flags = reader.ReadByte();
+            bone.reserved = reader.ReadBytes(13);
+            return bone;
+        }
+        
+        private static AnchorPointBuffer ReadAnchorBuffer(System.IO.BinaryReader reader)
+        {
+            var anchor = new AnchorPointBuffer();
+            anchor.bone_index = reader.ReadUInt32();
+            anchor.connected_anchors = new ushort[4];
+            for (int i = 0; i < 4; i++) anchor.connected_anchors[i] = reader.ReadUInt16();
+            anchor.curve_types = reader.ReadBytes(4);
+            anchor.curve_params = reader.ReadBytes(16);
+            anchor.pos_xyz = new ushort[3];
+            for (int i = 0; i < 3; i++) anchor.pos_xyz[i] = reader.ReadUInt16();
+            anchor.delta_xyz = new short[3];
+            for (int i = 0; i < 3; i++) anchor.delta_xyz[i] = reader.ReadInt16();
+            anchor.normal = reader.ReadBytes(3);
+            anchor.tangent_u = reader.ReadBytes(2);
+            anchor.tangent_v = reader.ReadBytes(2);
+            anchor.color = reader.ReadBytes(3);
+            anchor.roughness = reader.ReadByte();
+            anchor.metallic = reader.ReadByte();
+            anchor.anim_weight = reader.ReadByte();
+            anchor.curvature_u = reader.ReadByte();
+            anchor.curvature_v = reader.ReadByte();
+            anchor.continuity_flags = reader.ReadByte();
+            anchor.reserved = reader.ReadBytes(4);
+            return anchor;
+        }
+        
+        private static ProceduralSurfaceBuffer ReadSurfaceBuffer(System.IO.BinaryReader reader)
+        {
+            var surface = new ProceduralSurfaceBuffer();
+            surface.anchor_point_indices = new ushort[4];
+            for (int i = 0; i < 4; i++) surface.anchor_point_indices[i] = reader.ReadUInt16();
+            surface.surface_definition_index = reader.ReadUInt16();
+            surface.eqn_params = new float[8];
+            for (int i = 0; i < 8; i++) surface.eqn_params[i] = reader.ReadSingle();
+            surface.secondary_surface_type = reader.ReadByte();
+            surface.combination_param = reader.ReadByte();
+            surface.deformation_strength = reader.ReadByte();
+            surface.animation_param = reader.ReadByte();
+            surface.color_eqn_r = reader.ReadByte();
+            surface.color_param_r = reader.ReadByte();
+            surface.color_eqn_g = reader.ReadByte();
+            surface.color_param_g = reader.ReadByte();
+            surface.color_eqn_b = reader.ReadByte();
+            surface.color_param_b = reader.ReadByte();
+            surface.roughness = reader.ReadByte();
+            surface.metallic = reader.ReadByte();
+            surface.emissive_strength = reader.ReadByte();
+            surface.specular_tint = reader.ReadByte();
+            surface.normal_mode = reader.ReadByte();
+            surface.lod_bias = reader.ReadByte();
+            surface.surface_modifiers = reader.ReadByte();
+            surface.reserved = reader.ReadBytes(5);
+            return surface;
+        }
+    }
+
+    // =============================================================================
+    // PSF COLLECTION CONTAINER
+    // =============================================================================
+    
+    public class PSFCollection : IDisposable
+    {
+        public NativeArray<BoneBuffer> bones;
+        public NativeArray<AnchorPointBuffer> anchors;
+        public NativeArray<ProceduralSurfaceBuffer> surfaces;
+        
+        public void Dispose()
+        {
+            if (bones.IsCreated) bones.Dispose();
+            if (anchors.IsCreated) anchors.Dispose();
+            if (surfaces.IsCreated) surfaces.Dispose();
+        }
+    }
+
+    // =============================================================================
+    // UNITY EDITOR EXTENSIONS
+    // =============================================================================
+    
+#if UNITY_EDITOR
+    [UnityEditor.CustomEditor(typeof(PSFObject))]
+    public class PSFObjectEditor : UnityEditor.Editor
+    {
+        public override void OnInspectorGUI()
+        {
+            DrawDefaultInspector();
+            
+            PSFObject psfObj = (PSFObject)target;
+            
+            UnityEditor.EditorGUILayout.Space();
+            UnityEditor.EditorGUILayout.LabelField("PSF Statistics", UnityEditor.EditorStyles.boldLabel);
+            
+            if (psfObj.psfAsset != null)
+            {
+                UnityEditor.EditorGUILayout.LabelField($"Asset Size: {psfObj.psfAsset.bytes.Length} bytes");
+            }
+            
+            if (GUILayout.Button("Force Reload PSF"))
+            {
+                // Trigger reload
+            }
+            
+            if (GUILayout.Button("Export Current State"))
+            {
+                // Export current animated state as traditional mesh
+            }
+        }
+    }
+#endif
+}

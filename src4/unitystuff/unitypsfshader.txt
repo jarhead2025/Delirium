@@ -1,0 +1,803 @@
+Shader "PSF/ProceduralPoints"
+{
+    Properties
+    {
+        _PointSize ("Point Size", Range(0.001, 0.1)) = 0.02
+        _Metallic ("Metallic", Range(0, 1)) = 0.0
+        _Roughness ("Roughness", Range(0, 1)) = 0.5
+        _EmissionIntensity ("Emission Intensity", Range(0, 2)) = 0.0
+        _LODBias ("LOD Bias", Range(-2, 2)) = 0.0
+        _AnimationSpeed ("Animation Speed", Range(0, 5)) = 1.0
+    }
+    
+    SubShader
+    {
+        Tags { "RenderType"="Opaque" "RenderPipeline"="UniversalPipeline" }
+        
+        Pass
+        {
+            Name "ForwardLit"
+            Tags { "LightMode"="UniversalForward" }
+            
+            HLSLPROGRAM
+            #pragma vertex vert
+            #pragma fragment frag
+            #pragma geometry geom
+            
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
+            
+            struct Attributes
+            {
+                uint vertexID : SV_VertexID;
+            };
+            
+            struct Varyings
+            {
+                float4 positionCS : SV_POSITION;
+                float3 positionWS : TEXCOORD0;
+                float3 normalWS : TEXCOORD1;
+                float4 color : COLOR;
+                float3 viewDirWS : TEXCOORD2;
+                float fogCoord : TEXCOORD3;
+                float4 shadowCoord : TEXCOORD4;
+                float pointSize : PSIZE;
+            };
+            
+            struct GeomOutput
+            {
+                float4 positionCS : SV_POSITION;
+                float3 positionWS : TEXCOORD0;
+                float3 normalWS : TEXCOORD1;
+                float4 color : COLOR;
+                float3 viewDirWS : TEXCOORD2;
+                float2 uv : TEXCOORD3;
+                float fogCoord : TEXCOORD4;
+                float4 shadowCoord : TEXCOORD5;
+            };
+            
+            // Buffers from C#
+            StructuredBuffer<float3> _Points;
+            StructuredBuffer<float4> _Colors;
+            
+            // Properties
+            float _PointSize;
+            float _Metallic;
+            float _Roughness;
+            float _EmissionIntensity;
+            float _LODBias;
+            float _AnimationSpeed;
+            float4x4 _ObjectToWorld;
+            
+            Varyings vert(Attributes input)
+            {
+                Varyings output = (Varyings)0;
+                
+                // Get point data from structured buffers
+                float3 pointWS = mul(_ObjectToWorld, float4(_Points[input.vertexID], 1.0)).xyz;
+                float4 color = _Colors[input.vertexID];
+                
+                // Calculate procedural normal (simplified - could be improved)
+                float3 normalWS = normalize(pointWS - mul(_ObjectToWorld, float4(0, 0, 0, 1)).xyz);
+                
+                output.positionCS = TransformWorldToHClip(pointWS);
+                output.positionWS = pointWS;
+                output.normalWS = normalWS;
+                output.color = color;
+                output.viewDirWS = normalize(GetCameraPositionWS() - pointWS);
+                output.fogCoord = ComputeFogFactor(output.positionCS.z);
+                output.shadowCoord = TransformWorldToShadowCoord(pointWS);
+                
+                // Dynamic point size based on distance and LOD
+                float distance = length(GetCameraPositionWS() - pointWS);
+                output.pointSize = _PointSize * (10.0 / max(distance, 1.0)) * exp2(_LODBias);
+                
+                return output;
+            }
+            
+            // Geometry shader to convert points to quads for better visibility
+            [maxvertexcount(4)]
+            void geom(point Varyings input[1], inout TriangleStream<GeomOutput> outputStream)
+            {
+                GeomOutput output = (GeomOutput)0;
+                
+                // Copy shared data
+                output.positionWS = input[0].positionWS;
+                output.normalWS = input[0].normalWS;
+                output.color = input[0].color;
+                output.viewDirWS = input[0].viewDirWS;
+                output.fogCoord = input[0].fogCoord;
+                output.shadowCoord = input[0].shadowCoord;
+                
+                // Calculate billboard vectors
+                float3 up = float3(0, 1, 0);
+                float3 forward = normalize(input[0].viewDirWS);
+                float3 right = normalize(cross(up, forward));
+                up = cross(forward, right);
+                
+                float size = input[0].pointSize;
+                
+                // Generate quad vertices
+                float3 positions[4] = {
+                    input[0].positionWS + (-right - up) * size,
+                    input[0].positionWS + (right - up) * size,
+                    input[0].positionWS + (-right + up) * size,
+                    input[0].positionWS + (right + up) * size
+                };
+                
+                float2 uvs[4] = {
+                    float2(0, 0),
+                    float2(1, 0),
+                    float2(0, 1),
+                    float2(1, 1)
+                };
+                
+                for (int i = 0; i < 4; i++)
+                {
+                    output.positionCS = TransformWorldToHClip(positions[i]);
+                    output.uv = uvs[i];
+                    outputStream.Append(output);
+                }
+                
+                outputStream.RestartStrip();
+            }
+            
+            half4 frag(GeomOutput input) : SV_Target
+            {
+                // Calculate circular falloff for point
+                float2 center = input.uv - 0.5;
+                float distance = length(center);
+                if (distance > 0.5) discard;
+                
+                float alpha = 1.0 - smoothstep(0.3, 0.5, distance);
+                
+                // Basic lighting calculation
+                Light mainLight = GetMainLight(input.shadowCoord);
+                
+                // Lambertian diffuse
+                float NdotL = saturate(dot(input.normalWS, mainLight.direction));
+                float3 diffuse = mainLight.color * NdotL;
+                
+                // Simple specular
+                float3 halfDir = normalize(mainLight.direction + input.viewDirWS);
+                float NdotH = saturate(dot(input.normalWS, halfDir));
+                float specular = pow(NdotH, (1.0 - _Roughness) * 128.0) * _Metallic;
+                
+                // Combine lighting
+                float3 color = input.color.rgb * (diffuse + specular);
+                color += input.color.rgb * _EmissionIntensity;
+                
+                // Apply fog
+                color = MixFog(color, input.fogCoord);
+                
+                return half4(color, alpha * input.color.a);
+            }
+            
+            ENDHLSL
+        }
+        
+        // Shadow pass
+        Pass
+        {
+            Name "ShadowCaster"
+            Tags{"LightMode" = "ShadowCaster"}
+            
+            ZWrite On
+            ZTest LEqual
+            ColorMask 0
+            Cull Off
+            
+            HLSLPROGRAM
+            #pragma vertex vert_shadow
+            #pragma fragment frag_shadow
+            #pragma geometry geom_shadow
+            
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+            #include "Packages/com.unity.render-pipelines.universal/Shaders/LitInput.hlsl"
+            #include "Packages/com.unity.render-pipelines.universal/Shaders/ShadowCasterPass.hlsl"
+            
+            StructuredBuffer<float3> _Points;
+            float4x4 _ObjectToWorld;
+            float _PointSize;
+            
+            struct AttributesShadow
+            {
+                uint vertexID : SV_VertexID;
+            };
+            
+            struct VaryingsShadow
+            {
+                float4 positionCS : SV_POSITION;
+                float3 positionWS : TEXCOORD0;
+                float pointSize : PSIZE;
+            };
+            
+            VaryingsShadow vert_shadow(AttributesShadow input)
+            {
+                VaryingsShadow output;
+                float3 pointWS = mul(_ObjectToWorld, float4(_Points[input.vertexID], 1.0)).xyz;
+                output.positionCS = TransformWorldToHClip(pointWS);
+                output.positionWS = pointWS;
+                output.pointSize = _PointSize;
+                return output;
+            }
+            
+            [maxvertexcount(4)]
+            void geom_shadow(point VaryingsShadow input[1], inout TriangleStream<VaryingsShadow> outputStream)
+            {
+                // Similar quad generation for shadows
+                float3 lightDir = normalize(_MainLightPosition.xyz);
+                float3 up = float3(0, 1, 0);
+                float3 right = normalize(cross(up, lightDir));
+                up = cross(lightDir, right);
+                
+                float size = input[0].pointSize;
+                
+                for (int i = 0; i < 4; i++)
+                {
+                    VaryingsShadow output = input[0];
+                    float3 offset = (i == 0 ? -right - up : i == 1 ? right - up : i == 2 ? -right + up : right + up) * size;
+                    output.positionCS = TransformWorldToHClip(input[0].positionWS + offset);
+                    outputStream.Append(output);
+                }
+                outputStream.RestartStrip();
+            }
+            
+            half4 frag_shadow(VaryingsShadow input) : SV_Target
+            {
+                return 0;
+            }
+            
+            ENDHLSL
+        }
+    }
+    
+    FallBack "Hidden/Universal Render Pipeline/FallbackError"
+}
+
+// =============================================================================
+// C# PIPELINE MANAGER
+// =============================================================================
+
+using System.Collections.Generic;
+using UnityEngine;
+using Unity.Collections;
+using Unity.Jobs;
+using Unity.Mathematics;
+
+namespace ProceduralSurface.Unity
+{
+    /// <summary>
+    /// Central manager for PSF pipeline - handles object pooling, LOD management, and batch rendering
+    /// </summary>
+    public class PSFPipelineManager : MonoBehaviour
+    {
+        [Header("Pipeline Settings")]
+        public int maxActiveObjects = 1000;
+        public float cullingDistance = 100f;
+        public bool enableBatching = true;
+        public bool enableAsyncLoading = true;
+        
+        [Header("Performance")]
+        public int jobBatchSize = 32;
+        public float targetFrameTime = 16.67f; // 60 FPS
+        public int maxJobsPerFrame = 4;
+        
+        [Header("Quality")]
+        public PSFQualitySettings qualitySettings;
+        
+        // Object management
+        private List<PSFObject> activeObjects = new List<PSFObject>();
+        private List<PSFObject> culledObjects = new List<PSFObject>();
+        private Dictionary<string, PSFCollection> cachedPSFData = new Dictionary<string, PSFCollection>();
+        
+        // Batch rendering
+        private ComputeBuffer globalPointBuffer;
+        private ComputeBuffer globalColorBuffer;
+        private ComputeBuffer objectDataBuffer;
+        private Material batchMaterial;
+        
+        // Job management
+        private JobHandle batchJobHandle;
+        private NativeArray<PSFBatchData> batchData;
+        private Queue<System.Action> mainThreadActions = new Queue<System.Action>();
+        
+        // Statistics
+        private PSFRenderStats lastFrameStats;
+        
+        public static PSFPipelineManager Instance { get; private set; }
+        
+        void Awake()
+        {
+            if (Instance == null)
+            {
+                Instance = this;
+                DontDestroyOnLoad(gameObject);
+                InitializePipeline();
+            }
+            else
+            {
+                Destroy(gameObject);
+            }
+        }
+        
+        void Update()
+        {
+            ProcessMainThreadQueue();
+            UpdateObjectCulling();
+            UpdateLOD();
+            
+            if (enableBatching)
+            {
+                UpdateBatchRendering();
+            }
+            
+            UpdateStatistics();
+        }
+        
+        void OnDestroy()
+        {
+            CleanupPipeline();
+        }
+        
+        private void InitializePipeline()
+        {
+            // Initialize quality settings if not set
+            if (qualitySettings == null)
+            {
+                qualitySettings = PSFQualitySettings.CreateDefault();
+            }
+            
+            // Initialize batch rendering buffers
+            int maxPoints = maxActiveObjects * qualitySettings.maxPointsPerObject;
+            globalPointBuffer = new ComputeBuffer(maxPoints, 12); // float3
+            globalColorBuffer = new ComputeBuffer(maxPoints, 16); // Color
+            objectDataBuffer = new ComputeBuffer(maxActiveObjects, System.Runtime.InteropServices.Marshal.SizeOf<PSFObjectData>());
+            
+            batchData = new NativeArray<PSFBatchData>(maxActiveObjects, Allocator.Persistent);
+            
+            // Load batch material
+            batchMaterial = Resources.Load<Material>("PSF/BatchedProceduralMaterial");
+            
+            Debug.Log($"PSF Pipeline initialized: {maxActiveObjects} max objects, {maxPoints} max points");
+        }
+        
+        private void CleanupPipeline()
+        {
+            batchJobHandle.Complete();
+            
+            globalPointBuffer?.Release();
+            globalColorBuffer?.Release();
+            objectDataBuffer?.Release();
+            
+            if (batchData.IsCreated) batchData.Dispose();
+            
+            foreach (var cachedData in cachedPSFData.Values)
+            {
+                cachedData.Dispose();
+            }
+            cachedPSFData.Clear();
+        }
+        
+        public void RegisterObject(PSFObject psfObject)
+        {
+            if (!activeObjects.Contains(psfObject))
+            {
+                activeObjects.Add(psfObject);
+                
+                if (enableAsyncLoading && psfObject.psfAsset != null)
+                {
+                    LoadPSFDataAsync(psfObject);
+                }
+                
+                Debug.Log($"Registered PSF object: {psfObject.name}");
+            }
+        }
+        
+        public void UnregisterObject(PSFObject psfObject)
+        {
+            activeObjects.Remove(psfObject);
+            culledObjects.Remove(psfObject);
+        }
+        
+        private void LoadPSFDataAsync(PSFObject psfObject)
+        {
+            string assetPath = UnityEditor.AssetDatabase.GetAssetPath(psfObject.psfAsset);
+            
+            if (!cachedPSFData.ContainsKey(assetPath))
+            {
+                // Load on background thread
+                System.Threading.Tasks.Task.Run(() =>
+                {
+                    var collection = PSFLoader.LoadFromBytes(psfObject.psfAsset.bytes);
+                    
+                    // Queue for main thread
+                    lock (mainThreadActions)
+                    {
+                        mainThreadActions.Enqueue(() =>
+                        {
+                            cachedPSFData[assetPath] = collection;
+                            psfObject.OnPSFDataLoaded(collection);
+                        });
+                    }
+                });
+            }
+            else
+            {
+                psfObject.OnPSFDataLoaded(cachedPSFData[assetPath]);
+            }
+        }
+        
+        private void ProcessMainThreadQueue()
+        {
+            lock (mainThreadActions)
+            {
+                while (mainThreadActions.Count > 0)
+                {
+                    mainThreadActions.Dequeue().Invoke();
+                }
+            }
+        }
+        
+        private void UpdateObjectCulling()
+        {
+            Camera mainCamera = Camera.main;
+            if (mainCamera == null) return;
+            
+            Vector3 cameraPos = mainCamera.transform.position;
+            
+            // Move objects between active and culled lists based on distance
+            for (int i = activeObjects.Count - 1; i >= 0; i--)
+            {
+                PSFObject obj = activeObjects[i];
+                if (obj == null) continue;
+                
+                float distance = Vector3.Distance(cameraPos, obj.transform.position);
+                
+                if (distance > cullingDistance)
+                {
+                    activeObjects.RemoveAt(i);
+                    culledObjects.Add(obj);
+                    obj.SetCulled(true);
+                }
+            }
+            
+            for (int i = culledObjects.Count - 1; i >= 0; i--)
+            {
+                PSFObject obj = culledObjects[i];
+                if (obj == null) continue;
+                
+                float distance = Vector3.Distance(cameraPos, obj.transform.position);
+                
+                if (distance <= cullingDistance * 0.9f) // Hysteresis
+                {
+                    culledObjects.RemoveAt(i);
+                    activeObjects.Add(obj);
+                    obj.SetCulled(false);
+                }
+            }
+        }
+        
+        private void UpdateLOD()
+        {
+            Camera mainCamera = Camera.main;
+            if (mainCamera == null) return;
+            
+            Vector3 cameraPos = mainCamera.transform.position;
+            
+            foreach (PSFObject obj in activeObjects)
+            {
+                if (obj == null) continue;
+                
+                float distance = Vector3.Distance(cameraPos, obj.transform.position);
+                int newLOD = CalculateLOD(distance, obj.lodDistance);
+                obj.SetLOD(newLOD);
+            }
+        }
+        
+        private int CalculateLOD(float distance, float baseLODDistance)
+        {
+            float lodFactor = distance / baseLODDistance;
+            return Mathf.Clamp(Mathf.FloorToInt(lodFactor), 0, qualitySettings.maxLODLevel);
+        }
+        
+        private void UpdateBatchRendering()
+        {
+            batchJobHandle.Complete();
+            
+            // Prepare batch data
+            int objectCount = Mathf.Min(activeObjects.Count, maxActiveObjects);
+            
+            var job = new PSFBatchUpdateJob
+            {
+                objects = new NativeArray<PSFObjectReference>(objectCount, Allocator.TempJob),
+                batchData = batchData,
+                time = Time.time,
+                deltaTime = Time.deltaTime,
+                cameraPosition = Camera.main ? Camera.main.transform.position : Vector3.zero
+            };
+            
+            // Fill object references
+            for (int i = 0; i < objectCount; i++)
+            {
+                job.objects[i] = new PSFObjectReference
+                {
+                    transform = activeObjects[i].transform.localToWorldMatrix,
+                    animationTime = activeObjects[i].AnimationTime,
+                    lodLevel = activeObjects[i].CurrentLOD
+                };
+            }
+            
+            batchJobHandle = job.Schedule(objectCount, jobBatchSize);
+            
+            // After job completion, update GPU buffers
+            JobHandle.ScheduleBatchedJobs();
+        }
+        
+        private void UpdateStatistics()
+        {
+            lastFrameStats.activeObjects = activeObjects.Count;
+            lastFrameStats.culledObjects = culledObjects.Count;
+            lastFrameStats.frameTime = Time.deltaTime * 1000f;
+            lastFrameStats.memoryUsage = CalculateMemoryUsage();
+        }
+        
+        private long CalculateMemoryUsage()
+        {
+            long usage = 0;
+            
+            if (globalPointBuffer != null) usage += globalPointBuffer.count * globalPointBuffer.stride;
+            if (globalColorBuffer != null) usage += globalColorBuffer.count * globalColorBuffer.stride;
+            if (objectDataBuffer != null) usage += objectDataBuffer.count * objectDataBuffer.stride;
+            
+            return usage;
+        }
+        
+        public PSFRenderStats GetRenderStats()
+        {
+            return lastFrameStats;
+        }
+        
+        void OnGUI()
+        {
+            if (qualitySettings.showDebugInfo)
+            {
+                GUI.Label(new Rect(10, 10, 300, 20), $"PSF Objects: {activeObjects.Count} active, {culledObjects.Count} culled");
+                GUI.Label(new Rect(10, 30, 300, 20), $"Frame Time: {lastFrameStats.frameTime:F2}ms");
+                GUI.Label(new Rect(10, 50, 300, 20), $"Memory: {lastFrameStats.memoryUsage / (1024*1024)}MB");
+            }
+        }
+    }
+
+    // =============================================================================
+    // SUPPORTING STRUCTURES
+    // =============================================================================
+    
+    [System.Serializable]
+    public struct PSFBatchData
+    {
+        public float4x4 transform;
+        public float animationTime;
+        public int lodLevel;
+        public int pointCount;
+        public int startIndex;
+    }
+    
+    public struct PSFObjectReference
+    {
+        public float4x4 transform;
+        public float animationTime;
+        public int lodLevel;
+    }
+    
+    public struct PSFObjectData
+    {
+        public float4x4 objectToWorld;
+        public float4 animationParams; // time, speed, phase, intensity
+        public uint surfaceCount;
+        public uint pointOffset;
+        public uint lodLevel;
+        public uint flags;
+    }
+    
+    public struct PSFRenderStats
+    {
+        public int activeObjects;
+        public int culledObjects;
+        public float frameTime;
+        public long memoryUsage;
+        public int totalPoints;
+        public int visiblePoints;
+    }
+    
+    [Unity.Collections.LowLevel.Unsafe.BurstCompile]
+    public struct PSFBatchUpdateJob : IJobParallelFor
+    {
+        [ReadOnly] public NativeArray<PSFObjectReference> objects;
+        public NativeArray<PSFBatchData> batchData;
+        [ReadOnly] public float time;
+        [ReadOnly] public float deltaTime;
+        [ReadOnly] public float3 cameraPosition;
+        
+        public void Execute(int index)
+        {
+            var objRef = objects[index];
+            
+            batchData[index] = new PSFBatchData
+            {
+                transform = objRef.transform,
+                animationTime = objRef.animationTime,
+                lodLevel = objRef.lodLevel,
+                pointCount = CalculatePointCountForLOD(objRef.lodLevel),
+                startIndex = index * 1000 // Simplified indexing
+            };
+        }
+        
+        private int CalculatePointCountForLOD(int lodLevel)
+        {
+            return 1000 >> lodLevel; // Reduce points by half for each LOD level
+        }
+    }
+
+    // =============================================================================
+    // QUALITY SETTINGS
+    // =============================================================================
+    
+    [CreateAssetMenu(fileName = "PSFQualitySettings", menuName = "PSF/Quality Settings")]
+    public class PSFQualitySettings : ScriptableObject
+    {
+        [Header("Rendering")]
+        public int maxPointsPerObject = 1000;
+        public int maxLODLevel = 3;
+        public float pointSizeMultiplier = 1.0f;
+        
+        [Header("Animation")]
+        public bool enableAnimation = true;
+        public float maxAnimationDistance = 50f;
+        public int animationUpdateRate = 60;
+        
+        [Header("Physics")]
+        public bool enableDynamicColliders = true;
+        public int collisionMeshResolution = 32;
+        
+        [Header("Debug")]
+        public bool showDebugInfo = false;
+        public bool enableProfiling = false;
+        
+        public static PSFQualitySettings CreateDefault()
+        {
+            var settings = CreateInstance<PSFQualitySettings>();
+            settings.maxPointsPerObject = 1000;
+            settings.maxLODLevel = 3;
+            settings.pointSizeMultiplier = 1.0f;
+            settings.enableAnimation = true;
+            settings.maxAnimationDistance = 50f;
+            settings.animationUpdateRate = 60;
+            settings.enableDynamicColliders = true;
+            settings.collisionMeshResolution = 32;
+            return settings;
+        }
+    }
+
+    // =============================================================================
+    // COMPONENT EXTENSIONS
+    // =============================================================================
+    
+    public static class PSFObjectExtensions
+    {
+        public static void OnPSFDataLoaded(this PSFObject obj, PSFCollection collection)
+        {
+            // Called when PSF data is loaded asynchronously
+            obj.SetPSFCollection(collection);
+        }
+        
+        public static void SetCulled(this PSFObject obj, bool culled)
+        {
+            obj.enabled = !culled;
+        }
+        
+        public static void SetLOD(this PSFObject obj, int lodLevel)
+        {
+            obj.CurrentLOD = lodLevel;
+        }
+        
+        public static float AnimationTime
+        {
+            get { return Time.time; } // Simplified - could be per-object
+        }
+        
+        public static int CurrentLOD { get; set; }
+        
+        public static void SetPSFCollection(this PSFObject obj, PSFCollection collection)
+        {
+            // Implementation would update internal PSF data
+        }
+    }
+
+    // =============================================================================
+    // COMPOSITE OBJECT SYSTEM
+    // =============================================================================
+    
+    /// <summary>
+    /// Allows building complex objects from multiple PSF components
+    /// </summary>
+    public class PSFCompositeObject : MonoBehaviour
+    {
+        [Header("Components")]
+        public PSFComponentDefinition[] components;
+        
+        [Header("Assembly")]
+        public bool autoAssemble = true;
+        public Vector3 assemblyOffset = Vector3.zero;
+        public bool enableJoints = true;
+        
+        private List<PSFObject> instantiatedComponents = new List<PSFObject>();
+        private List<Joint> joints = new List<Joint>();
+        
+        [System.Serializable]
+        public struct PSFComponentDefinition
+        {
+            public GameObject psfPrefab;
+            public Vector3 localPosition;
+            public Vector3 localRotation;
+            public Vector3 localScale;
+            public string connectionPoint;
+            public bool isMainComponent;
+        }
+        
+        void Start()
+        {
+            if (autoAssemble)
+            {
+                AssembleComponents();
+            }
+        }
+        
+        public void AssembleComponents()
+        {
+            foreach (var componentDef in components)
+            {
+                GameObject instance = Instantiate(componentDef.psfPrefab, transform);
+                instance.transform.localPosition = componentDef.localPosition;
+                instance.transform.localRotation = Quaternion.Euler(componentDef.localRotation);
+                instance.transform.localScale = componentDef.localScale;
+                
+                PSFObject psfObj = instance.GetComponent<PSFObject>();
+                if (psfObj != null)
+                {
+                    instantiatedComponents.Add(psfObj);
+                    
+                    if (enableJoints && !componentDef.isMainComponent)
+                    {
+                        CreateJoint(psfObj, componentDef);
+                    }
+                }
+            }
+        }
+        
+        private void CreateJoint(PSFObject component, PSFComponentDefinition definition)
+        {
+            Rigidbody rb = component.GetComponent<Rigidbody>();
+            if (rb == null) rb = component.gameObject.AddComponent<Rigidbody>();
+            
+            FixedJoint joint = component.gameObject.AddComponent<FixedJoint>();
+            joint.connectedBody = GetComponent<Rigidbody>();
+            joints.Add(joint);
+        }
+        
+        public void DisassembleComponents()
+        {
+            foreach (var component in instantiatedComponents)
+            {
+                if (component != null) DestroyImmediate(component.gameObject);
+            }
+            instantiatedComponents.Clear();
+            
+            foreach (var joint in joints)
+            {
+                if (joint != null) DestroyImmediate(joint);
+            }
+            joints.Clear();
+        }
+    }
+}

@@ -1,0 +1,383 @@
+// PSF Triangle Generation Compute Shader
+// Generates proper triangulated geometry from PSF mathematical equations on GPU
+// Place this file at: Assets/Resources/PSF/Shaders/PSFTriangleGeneration.compute
+
+#pragma kernel CSMain
+
+#define THREAD_GROUP_SIZE 64
+
+// PSF data structures (matching C# exactly)
+struct ProceduralSurfaceBuffer
+{
+    uint4 anchor_point_indices;      // 8 bytes packed
+    uint surface_definition_index;   // 2 bytes packed
+    uint padding1;                   // 2 bytes padding
+    float4 eqn_params0;              // 16 bytes (first 4 params)
+    float4 eqn_params1;              // 16 bytes (next 4 params)
+    uint4 surface_properties;        // 16 bytes packed
+};
+
+struct AnchorPointBuffer
+{
+    uint bone_index;                 // 4 bytes
+    uint4 connectivity;              // 16 bytes packed
+    uint4 curve_data;                // 16 bytes packed
+    uint4 position_data;             // 16 bytes packed position and delta
+    uint4 material_data;             // 12 bytes packed + padding
+};
+
+// Input buffers
+StructuredBuffer<ProceduralSurfaceBuffer> _SurfaceBuffer;
+StructuredBuffer<AnchorPointBuffer> _AnchorBuffer;
+StructuredBuffer<float4x4> _BoneMatrixBuffer;
+StructuredBuffer<float> _ParameterBuffer;
+
+// Output buffers for triangulated mesh
+RWStructuredBuffer<float3> _VertexBuffer;
+RWStructuredBuffer<float3> _NormalBuffer;
+RWStructuredBuffer<float4> _ColorBuffer;
+RWStructuredBuffer<float2> _UVBuffer;
+RWStructuredBuffer<uint> _IndexBuffer;
+
+// Shader parameters
+float _AnimationTime;
+float _Time;
+int _Resolution;
+int _SurfaceCount;
+float4x4 _ObjectToWorld;
+
+// Utility functions
+float3 DecodeAnchorPosition(uint4 positionData)
+{
+    uint x = (positionData.x & 0xFFFF);
+    uint y = (positionData.x >> 16);
+    uint z = (positionData.y & 0xFFFF);
+    
+    float3 pos;
+    pos.x = ((float)x - 32768.0) / 32768.0 * 1.8;
+    pos.y = ((float)y - 32768.0) / 32768.0 * 1.8;
+    pos.z = ((float)z - 32768.0) / 32768.0 * 1.8;
+    
+    return pos;
+}
+
+// Mathematical surface equation evaluation
+float3 EvaluateSurfaceEquation(ProceduralSurfaceBuffer surface, float u, float v, float time)
+{
+    uint surfaceType = (surface.surface_properties.x & 0xFF);
+    float4 params0 = surface.eqn_params0;
+    float4 params1 = surface.eqn_params1;
+    
+    float3 displacement = float3(0, 0, 0);
+    
+    switch (surfaceType)
+    {
+        case 0: // Plane
+            displacement = float3(0, 0, 0);
+            break;
+            
+        case 1: // Sine wave surface
+            {
+                float frequency = params0.x;
+                float amplitude = params0.y;
+                float phase = params0.z;
+                float waveU = sin(u * frequency * 6.28318 + time * 6.28318 + phase) * amplitude;
+                float waveV = sin(v * frequency * 6.28318 + time * 6.28318 + phase) * amplitude;
+                displacement = float3(0, (waveU + waveV) * 0.1, 0);
+            }
+            break;
+            
+        case 2: // Bezier patch
+            {
+                float height = params0.x * u * v + params0.y * (1.0 - u) * v + params0.z * u * (1.0 - v) + params0.w * (1.0 - u) * (1.0 - v);
+                displacement = float3(0, height * 0.2, 0);
+            }
+            break;
+            
+        case 3: // Ripple surface
+            {
+                float frequency = params0.x;
+                float amplitude = params0.y;
+                float decay = params0.z;
+                float centerU = 0.5;
+                float centerV = 0.5;
+                float distance = sqrt((u - centerU) * (u - centerU) + (v - centerV) * (v - centerV));
+                float ripple = sin(distance * frequency * 6.28318 - time * 12.56636) * amplitude * exp(-distance * decay);
+                displacement = float3(0, ripple * 0.1, 0);
+            }
+            break;
+            
+        case 4: // Cylindrical surface
+            {
+                float radius = params0.x;
+                float height = params0.y;
+                float angle = u * 6.28318;
+                displacement = float3(cos(angle) * radius * 0.2, v * height * 0.2, sin(angle) * radius * 0.2);
+            }
+            break;
+            
+        case 5: // Spherical surface
+            {
+                float radius = params0.x;
+                float theta = u * 6.28318;
+                float phi = v * 3.14159;
+                displacement = float3(
+                    sin(phi) * cos(theta) * radius * 0.2,
+                    cos(phi) * radius * 0.2,
+                    sin(phi) * sin(theta) * radius * 0.2
+                );
+            }
+            break;
+            
+        case 6: // Torus surface
+            {
+                float majorRadius = params0.x;
+                float minorRadius = params0.y;
+                float u_angle = u * 6.28318;
+                float v_angle = v * 6.28318;
+                float torusRadius = majorRadius + minorRadius * cos(v_angle);
+                displacement = float3(
+                    torusRadius * cos(u_angle) * 0.2,
+                    minorRadius * sin(v_angle) * 0.2,
+                    torusRadius * sin(u_angle) * 0.2
+                );
+            }
+            break;
+            
+        case 7: // Noise-based surface
+            {
+                float scale = params0.x;
+                float amplitude = params0.y;
+                float octaves = params0.z;
+                
+                float noise = 0.0;
+                float freq = scale;
+                float amp = amplitude;
+                
+                for (int i = 0; i < (int)octaves; i++)
+                {
+                    noise += sin(u * freq * 13.7 + time) * cos(v * freq * 17.3 + time) * amp;
+                    freq *= 2.0;
+                    amp *= 0.5;
+                }
+                
+                displacement = float3(0, noise * 0.1, 0);
+            }
+            break;
+            
+        case 8: // Warped plane
+            {
+                float warpU = params0.x;
+                float warpV = params0.y;
+                float intensity = params0.z;
+                
+                float warpedU = u + sin(v * warpU * 6.28318 + time * 2.0) * intensity * 0.1;
+                float warpedV = v + sin(u * warpV * 6.28318 + time * 2.0) * intensity * 0.1;
+                
+                displacement = float3(
+                    (warpedU - u) * 0.5,
+                    sin(warpedU * 6.28318) * sin(warpedV * 6.28318) * intensity * 0.1,
+                    (warpedV - v) * 0.5
+                );
+            }
+            break;
+            
+        default:
+            displacement = float3(0, 0, 0);
+            break;
+    }
+    
+    return displacement;
+}
+
+// Calculate surface normal using finite differences
+float3 CalculateSurfaceNormal(ProceduralSurfaceBuffer surface, float u, float v, float time, float epsilon = 0.01)
+{
+    float3 p = EvaluateSurfaceEquation(surface, u, v, time);
+    float3 pu = EvaluateSurfaceEquation(surface, u + epsilon, v, time);
+    float3 pv = EvaluateSurfaceEquation(surface, u, v + epsilon, time);
+    
+    float3 du = (pu - p) / epsilon;
+    float3 dv = (pv - p) / epsilon;
+    
+    float3 normal = normalize(cross(du, dv));
+    
+    // Fallback to up vector if normal is degenerate
+    if (length(normal) < 0.1)
+        normal = float3(0, 1, 0);
+    
+    return normal;
+}
+
+// Evaluate mathematical color at UV coordinates
+float4 EvaluateMathematicalColor(ProceduralSurfaceBuffer surface, float u, float v, float time)
+{
+    // Extract color equation data from packed properties
+    uint eqn_r = (surface.surface_properties.z & 0xFF);
+    uint param_r = ((surface.surface_properties.z >> 8) & 0xFF);
+    uint eqn_g = ((surface.surface_properties.z >> 16) & 0xFF);
+    uint param_g = ((surface.surface_properties.z >> 24) & 0xFF);
+    uint eqn_b = (surface.surface_properties.w & 0xFF);
+    uint param_b = ((surface.surface_properties.w >> 8) & 0xFF);
+    
+    float r = EvaluateColorChannel(eqn_r, param_r, u, v, time);
+    float g = EvaluateColorChannel(eqn_g, param_g, u, v, time);
+    float b = EvaluateColorChannel(eqn_b, param_b, u, v, time);
+    
+    return float4(clamp(r, 0.0, 1.0), clamp(g, 0.0, 1.0), clamp(b, 0.0, 1.0), 1.0);
+}
+
+float EvaluateColorChannel(uint equation, uint param, float u, float v, float time)
+{
+    float paramFloat = (float)param / 255.0;
+    
+    switch (equation)
+    {
+        case 0: return paramFloat; // Constant
+        case 1: return paramFloat * u; // Linear U
+        case 2: return paramFloat * v; // Linear V
+        case 3: return paramFloat * u * v; // Bilinear
+        case 4: return paramFloat * (0.5 + 0.5 * sin(u * 6.28318 + time * 3.14159)); // Animated sine
+        case 5: return paramFloat * (0.5 + 0.5 * cos(v * 6.28318 + time * 3.14159)); // Animated cosine
+        case 6: return paramFloat * (u * u); // Quadratic U
+        case 7: return paramFloat * (v * v); // Quadratic V
+        default: return paramFloat;
+    }
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    uint vertexIndex = id.x;
+    
+    // Calculate which surface and which vertex within that surface
+    uint verticesPerSurface = (_Resolution + 1) * (_Resolution + 1);
+    uint surfaceIndex = vertexIndex / verticesPerSurface;
+    uint vertexInSurface = vertexIndex % verticesPerSurface;
+    
+    // Check bounds
+    if (surfaceIndex >= (uint)_SurfaceCount)
+        return;
+    
+    if (vertexInSurface >= verticesPerSurface)
+        return;
+    
+    // Get surface data
+    ProceduralSurfaceBuffer surface = _SurfaceBuffer[surfaceIndex];
+    
+    // Calculate grid position
+    uint row = vertexInSurface / (uint)(_Resolution + 1);
+    uint col = vertexInSurface % (uint)(_Resolution + 1);
+    
+    float u = (float)col / (float)_Resolution;
+    float v = (float)row / (float)_Resolution;
+    
+    // Get anchor positions for this surface
+    float3 anchors[4];
+    
+    // Extract anchor indices
+    uint anchor0 = (surface.anchor_point_indices.x & 0xFFFF);
+    uint anchor1 = (surface.anchor_point_indices.x >> 16);
+    uint anchor2 = (surface.anchor_point_indices.y & 0xFFFF);
+    uint anchor3 = (surface.anchor_point_indices.y >> 16);
+    
+    // Get anchor positions
+    if (anchor0 < (uint)_AnchorBuffer.Length)
+        anchors[0] = DecodeAnchorPosition(_AnchorBuffer[anchor0].position_data);
+    else
+        anchors[0] = float3(-1, 0, -1);
+    
+    if (anchor1 < (uint)_AnchorBuffer.Length)
+        anchors[1] = DecodeAnchorPosition(_AnchorBuffer[anchor1].position_data);
+    else
+        anchors[1] = float3(1, 0, -1);
+    
+    if (anchor2 < (uint)_AnchorBuffer.Length)
+        anchors[2] = DecodeAnchorPosition(_AnchorBuffer[anchor2].position_data);
+    else
+        anchors[2] = float3(1, 0, 1);
+    
+    if (anchor3 < (uint)_AnchorBuffer.Length)
+        anchors[3] = DecodeAnchorPosition(_AnchorBuffer[anchor3].position_data);
+    else
+        anchors[3] = float3(-1, 0, 1);
+    
+    // Bilinear interpolation of base surface
+    float3 top = lerp(anchors[0], anchors[1], u);
+    float3 bottom = lerp(anchors[3], anchors[2], u);
+    float3 basePosition = lerp(top, bottom, v);
+    
+    // Apply mathematical surface equation
+    float3 displacement = EvaluateSurfaceEquation(surface, u, v, _AnimationTime);
+    float3 finalPosition = basePosition + displacement;
+    
+    // Transform to world space
+    float4 worldPos = mul(_ObjectToWorld, float4(finalPosition, 1.0));
+    
+    // Calculate surface normal
+    float3 normal = CalculateSurfaceNormal(surface, u, v, _AnimationTime);
+    float3 worldNormal = normalize(mul((float3x3)_ObjectToWorld, normal));
+    
+    // Evaluate color
+    float4 color = EvaluateMathematicalColor(surface, u, v, _AnimationTime);
+    
+    // Output vertex data
+    _VertexBuffer[vertexIndex] = worldPos.xyz;
+    _NormalBuffer[vertexIndex] = worldNormal;
+    _ColorBuffer[vertexIndex] = color;
+    _UVBuffer[vertexIndex] = float2(u, v);
+}
+
+// Separate kernel for generating triangle indices
+#pragma kernel GenerateIndices
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void GenerateIndices(uint3 id : SV_DispatchThreadID)
+{
+    uint triangleIndex = id.x;
+    
+    // Calculate which surface and which triangle within that surface
+    uint trianglesPerSurface = _Resolution * _Resolution * 2;
+    uint surfaceIndex = triangleIndex / trianglesPerSurface;
+    uint triangleInSurface = triangleIndex % trianglesPerSurface;
+    
+    if (surfaceIndex >= (uint)_SurfaceCount)
+        return;
+    
+    if (triangleInSurface >= trianglesPerSurface)
+        return;
+    
+    // Calculate quad position
+    uint quadIndex = triangleInSurface / 2;
+    uint triangleInQuad = triangleInSurface % 2;
+    
+    uint quadRow = quadIndex / (uint)_Resolution;
+    uint quadCol = quadIndex % (uint)_Resolution;
+    
+    // Calculate vertex indices for this quad
+    uint verticesPerSurface = (_Resolution + 1) * (_Resolution + 1);
+    uint surfaceBaseIndex = surfaceIndex * verticesPerSurface;
+    
+    uint i0 = surfaceBaseIndex + quadRow * (_Resolution + 1) + quadCol;
+    uint i1 = surfaceBaseIndex + quadRow * (_Resolution + 1) + (quadCol + 1);
+    uint i2 = surfaceBaseIndex + (quadRow + 1) * (_Resolution + 1) + (quadCol + 1);
+    uint i3 = surfaceBaseIndex + (quadRow + 1) * (_Resolution + 1) + quadCol;
+    
+    // Generate triangle indices
+    uint baseTriangleIndex = triangleIndex * 3;
+    
+    if (triangleInQuad == 0)
+    {
+        // First triangle: i0, i1, i2
+        _IndexBuffer[baseTriangleIndex + 0] = i0;
+        _IndexBuffer[baseTriangleIndex + 1] = i1;
+        _IndexBuffer[baseTriangleIndex + 2] = i2;
+    }
+    else
+    {
+        // Second triangle: i0, i2, i3
+        _IndexBuffer[baseTriangleIndex + 0] = i0;
+        _IndexBuffer[baseTriangleIndex + 1] = i2;
+        _IndexBuffer[baseTriangleIndex + 2] = i3;
+    }
+}

@@ -1,0 +1,49 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: e7f8d5f6b4c8f2a4a9e5c6d3f2b8a1c7, type: 3}
+  m_Name: PSFQualitySettings
+  maxPointsPerObject: 1000
+  maxLODLevel: 3
+  pointSizeMultiplier: 1
+  enableLOD: 1
+  lodDistanceScale: 1
+  enableAnimation: 1
+  maxAnimationDistance: 50
+  animationUpdateRate: 60
+  enableAnimationLOD: 1
+  enableDynamicColliders: 1
+  collisionMeshResolution: 16
+  colliderUpdateFrequency: 30
+  enablePhysicsLOD: 1
+  maxGPUMemoryMB: 512
+  enableAutoGC: 1
+  gcThreshold: 0.8
+  maxCachedCollections: 100
+  enableMultiThreading: 1
+  jobBatchSize: 32
+  maxJobsPerFrame: 4
+  targetFrameTime: 16.67
+  enableFrustumCulling: 1
+  enableDistanceCulling: 1
+  maxRenderDistance: 200
+  enableOcclusionCulling: 0
+  enableBatchRendering: 1
+  maxObjectsPerBatch: 100
+  enableGPUInstancing: 1
+  showDebugInfo: 0
+  enableProfiling: 0
+  enableDebugLogging: 0
+  showWireframe: 0
+  highlightLODChanges: 0
+  qualityPreset: 2
+  enableAdaptiveQuality: 0
+  targetFPS: 60

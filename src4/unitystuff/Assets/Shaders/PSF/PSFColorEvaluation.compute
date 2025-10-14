@@ -1,0 +1,283 @@
+// PSF Color Evaluation Compute Shader
+// Evaluates procedural colors on GPU using mathematical equations
+// Place this file at: Assets/Resources/PSF/Shaders/PSFColorEvaluation.compute
+
+#pragma kernel CSMain
+
+#define THREAD_GROUP_SIZE 64
+
+// PSF Surface structure (matching C# exactly)
+struct ProceduralSurfaceBuffer
+{
+    uint4 anchor_point_indices;      // 8 bytes packed
+    uint surface_definition_index;   // 2 bytes packed
+    uint padding1;                   // 2 bytes padding
+    float4 eqn_params0;              // 16 bytes (first 4 params)
+    float4 eqn_params1;              // 16 bytes (next 4 params)
+    uint4 surface_properties;        // 16 bytes packed (includes color equations)
+};
+
+// Input buffers
+StructuredBuffer<ProceduralSurfaceBuffer> _SurfaceBuffer;
+StructuredBuffer<float> _ParameterBuffer;
+
+// Output buffer
+RWStructuredBuffer<float4> _ColorBuffer;
+
+// Shader parameters
+float _AnimationTime;
+float _Time;
+int _PointCount;
+int _PointsPerSurface;
+int _SurfaceCount;
+
+// Color equation evaluation functions
+float EvaluateColorChannel(uint equation, uint param, float u, float v, float time)
+{
+    float paramFloat = (float)param / 255.0;
+    
+    switch (equation)
+    {
+        case 0: // Constant
+            return paramFloat;
+            
+        case 1: // Linear U
+            return paramFloat * u;
+            
+        case 2: // Linear V
+            return paramFloat * v;
+            
+        case 3: // Bilinear
+            return paramFloat * u * v;
+            
+        case 4: // Sine wave U
+            return paramFloat * (0.5 + 0.5 * sin(u * 6.28318 + time * 3.14159));
+            
+        case 5: // Cosine wave V
+            return paramFloat * (0.5 + 0.5 * cos(v * 6.28318 + time * 3.14159));
+            
+        case 6: // Quadratic U
+            return paramFloat * (u * u);
+            
+        case 7: // Quadratic V
+            return paramFloat * (v * v);
+            
+        case 8: // Radial
+            {
+                float2 center = float2(0.5, 0.5);
+                float distance = length(float2(u, v) - center);
+                return paramFloat * (1.0 - clamp(distance * 2.0, 0.0, 1.0));
+            }
+            
+        case 9: // Checkerboard
+            {
+                float scale = paramFloat * 10.0 + 1.0;
+                float checker = step(0.5, frac(u * scale)) != step(0.5, frac(v * scale));
+                return paramFloat * checker;
+            }
+            
+        case 10: // Noise
+            {
+                float scale = paramFloat * 20.0 + 1.0;
+                // Simple pseudo-noise using sin functions
+                float noise = sin(u * scale * 12.9898) * cos(v * scale * 78.233) * sin(time * 2.0);
+                return paramFloat * (0.5 + 0.5 * noise);
+            }
+            
+        case 11: // Spiral
+            {
+                float2 center = float2(0.5, 0.5);
+                float2 pos = float2(u, v) - center;
+                float angle = atan2(pos.y, pos.x);
+                float radius = length(pos);
+                float spiral = sin(angle * 3.0 + radius * 20.0 + time * 4.0);
+                return paramFloat * (0.5 + 0.5 * spiral);
+            }
+            
+        case 12: // Perlin-like noise
+            {
+                float scale = paramFloat * 8.0 + 1.0;
+                float2 p = float2(u, v) * scale;
+                float2 i = floor(p);
+                float2 f = frac(p);
+                
+                // Simple gradient noise approximation
+                float a = sin(i.x * 12.9898 + i.y * 78.233) * 43758.5453;
+                float b = sin((i.x + 1.0) * 12.9898 + i.y * 78.233) * 43758.5453;
+                float c = sin(i.x * 12.9898 + (i.y + 1.0) * 78.233) * 43758.5453;
+                float d = sin((i.x + 1.0) * 12.9898 + (i.y + 1.0) * 78.233) * 43758.5453;
+                
+                a = frac(a);
+                b = frac(b);
+                c = frac(c);
+                d = frac(d);
+                
+                float2 u_smooth = f * f * (3.0 - 2.0 * f);
+                float noise = lerp(lerp(a, b, u_smooth.x), lerp(c, d, u_smooth.x), u_smooth.y);
+                
+                return paramFloat * noise;
+            }
+            
+        case 13: // Wave interference
+            {
+                float freq1 = 5.0;
+                float freq2 = 7.0;
+                float wave1 = sin(u * freq1 * 6.28318 + time * 2.0);
+                float wave2 = sin(v * freq2 * 6.28318 + time * 1.5);
+                float interference = (wave1 + wave2) * 0.5;
+                return paramFloat * (0.5 + 0.5 * interference);
+            }
+            
+        case 14: // Cellular/Voronoi-like
+            {
+                float scale = paramFloat * 5.0 + 1.0;
+                float2 p = float2(u, v) * scale;
+                float2 cell = floor(p);
+                float2 f = frac(p);
+                
+                float minDist = 1.0;
+                for (int i = -1; i <= 1; i++)
+                {
+                    for (int j = -1; j <= 1; j++)
+                    {
+                        float2 neighbor = float2(i, j);
+                        float2 point = 0.5 + 0.5 * sin(time + 6.28318 * frac(sin((cell + neighbor) * float2(12.9898, 78.233)) * 43758.5453));
+                        float2 diff = neighbor + point - f;
+                        float dist = length(diff);
+                        minDist = min(minDist, dist);
+                    }
+                }
+                
+                return paramFloat * (1.0 - minDist);
+            }
+            
+        default:
+            return paramFloat;
+    }
+}
+
+// Extract color equation data from packed surface properties
+void ExtractColorData(uint4 properties, out uint eqn_r, out uint param_r, out uint eqn_g, out uint param_g, out uint eqn_b, out uint param_b)
+{
+    // Color equations are packed in properties.z and properties.w
+    eqn_r = (properties.z & 0xFF);
+    param_r = ((properties.z >> 8) & 0xFF);
+    eqn_g = ((properties.z >> 16) & 0xFF);
+    param_g = ((properties.z >> 24) & 0xFF);
+    
+    eqn_b = (properties.w & 0xFF);
+    param_b = ((properties.w >> 8) & 0xFF);
+}
+
+// Evaluate complete color for a point
+float4 EvaluateColor(ProceduralSurfaceBuffer surface, float u, float v, float time)
+{
+    // Extract color equation data
+    uint eqn_r, param_r, eqn_g, param_g, eqn_b, param_b;
+    ExtractColorData(surface.surface_properties, eqn_r, param_r, eqn_g, param_g, eqn_b, param_b);
+    
+    // Evaluate each color channel
+    float r = EvaluateColorChannel(eqn_r, param_r, u, v, time);
+    float g = EvaluateColorChannel(eqn_g, param_g, u, v, time);
+    float b = EvaluateColorChannel(eqn_b, param_b, u, v, time);
+    
+    // Clamp values to [0,1]
+    r = clamp(r, 0.0, 1.0);
+    g = clamp(g, 0.0, 1.0);
+    b = clamp(b, 0.0, 1.0);
+    
+    // Apply animation modulation
+    uint animParam = ((surface.surface_properties.x >> 24) & 0xFF);
+    if (animParam > 0)
+    {
+        float animMod = 0.5 + 0.5 * sin(time * 2.0 * 3.14159);
+        float intensity = (float)animParam / 255.0;
+        
+        r = lerp(r, r * animMod, intensity);
+        g = lerp(g, g * animMod, intensity);
+        b = lerp(b, b * animMod, intensity);
+    }
+    
+    return float4(r, g, b, 1.0);
+}
+
+// Apply color space conversions and enhancements
+float4 PostProcessColor(float4 color, float u, float v, float time)
+{
+    // Gamma correction
+    color.rgb = pow(color.rgb, 1.0 / 2.2);
+    
+    // Subtle color enhancement based on position
+    float enhancement = 0.1 * sin(u * 3.14159) * sin(v * 3.14159);
+    color.rgb = color.rgb * (1.0 + enhancement);
+    
+    // Temporal color shift
+    float timeShift = sin(time * 0.5) * 0.05;
+    color.r = clamp(color.r + timeShift, 0.0, 1.0);
+    color.b = clamp(color.b - timeShift, 0.0, 1.0);
+    
+    // Ensure alpha is 1.0
+    color.a = 1.0;
+    
+    return color;
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    uint pointIndex = id.x;
+    
+    // Check bounds
+    if (pointIndex >= (uint)_PointCount)
+        return;
+    
+    // Calculate which surface and which point within surface
+    uint surfaceIndex = pointIndex / (uint)_PointsPerSurface;
+    uint pointInSurface = pointIndex % (uint)_PointsPerSurface;
+    
+    if (surfaceIndex >= (uint)_SurfaceCount)
+        return;
+    
+    // Get surface data
+    ProceduralSurfaceBuffer surface = _SurfaceBuffer[surfaceIndex];
+    
+    // Calculate UV coordinates for this point
+    uint pointsPerRow = (uint)sqrt((float)_PointsPerSurface);
+    if (pointsPerRow == 0) pointsPerRow = 1;
+    
+    uint row = pointInSurface / pointsPerRow;
+    uint col = pointInSurface % pointsPerRow;
+    
+    float u = (float)col / (float)(pointsPerRow - 1);
+    float v = (float)row / (float)(pointsPerRow - 1);
+    
+    // Handle edge case for single point
+    if (pointsPerRow == 1)
+    {
+        u = 0.5;
+        v = 0.5;
+    }
+    else
+    {
+        u = clamp(u, 0.0, 1.0);
+        v = clamp(v, 0.0, 1.0);
+    }
+    
+    // Evaluate color using mathematical equations
+    float4 color = EvaluateColor(surface, u, v, _AnimationTime);
+    
+    // Apply post-processing
+    color = PostProcessColor(color, u, v, _AnimationTime);
+    
+    // Apply additional modulation based on surface parameters
+    uint parameterOffset = surfaceIndex * 8;
+    if (parameterOffset + 7 < (uint)_ParameterBuffer.Length)
+    {
+        // Use equation parameters to modulate color
+        float colorMod = _ParameterBuffer[parameterOffset + 6]; // Use 7th parameter for color modulation
+        color.rgb = color.rgb * (0.5 + 0.5 * colorMod);
+    }
+    
+    // Output final color
+    _ColorBuffer[pointIndex] = color;
+}

@@ -1,0 +1,168 @@
+#pragma kernel CSMain
+
+struct ProceduralSurfaceBuffer
+{
+    uint4 anchor_point_indices;     // 4 ushorts packed into uint4
+    uint surface_definition_index;
+    float eqn_params[8];
+    uint4 surface_properties;       // Packed surface properties
+    uint4 color_data;              // Packed color equations and parameters
+    uint4 material_properties;     // Packed material data
+    uint4 reserved;
+};
+
+struct AnchorPointBuffer
+{
+    uint bone_index;
+    uint4 connectivity_data[4];    // Connected anchors and curve data
+    uint4 position_data[2];        // Position, delta, normals, tangents
+    uint4 color_and_material;      // Color, roughness, metallic, etc.
+    uint4 curvature_data;
+    uint4 reserved;
+};
+
+struct BoneBuffer
+{
+    uint parent_bone_index;
+    uint child_bone_index;
+    uint4 transform_data[3];       // Position, orientation, velocities
+    float4 physical_params;
+    uint4 reserved;
+};
+
+StructuredBuffer<ProceduralSurfaceBuffer> _SurfaceBuffer;
+StructuredBuffer<AnchorPointBuffer> _AnchorBuffer;
+StructuredBuffer<BoneBuffer> _BoneBuffer;
+
+RWStructuredBuffer<float3> _OutputPoints;
+RWStructuredBuffer<float4> _OutputColors;
+RWStructuredBuffer<float3> _OutputNormals;
+
+float _AnimationTime;
+float _Time;
+int _PointsPerSurface;
+int _SurfaceCount;
+float4x4 _ObjectToWorld;
+
+// Decode anchor position from PSF format
+float3 DecodeAnchorPosition(uint4 positionData)
+{
+    uint3 encoded = positionData.xyz;
+    return float3(
+        (encoded.x - 32768.0) / 32768.0 * 1.8,
+        (encoded.y - 32768.0) / 32768.0 * 1.8,
+        (encoded.z - 32768.0) / 32768.0 * 1.8
+    );
+}
+
+// Evaluate mathematical surface equation
+float3 EvaluateSurfaceEquation(ProceduralSurfaceBuffer surface, float u, float v, float time)
+{
+    uint surfaceType = (surface.surface_properties.x >> 0) & 0xFF;
+    
+    switch (surfaceType)
+    {
+        case 0: // Plane
+            return float3(0, 0, 0);
+            
+        case 1: // Sine wave
+            return float3(0, sin(u * 6.283 + time * 2.0) * 0.1, 0);
+            
+        case 2: // Bezier patch
+            float height = surface.eqn_params[0] * u * v + surface.eqn_params[1] * (1-u) * v;
+            return float3(0, height * 0.2, 0);
+            
+        case 3: // Ripple
+            float dist = sqrt(u*u + v*v);
+            return float3(0, sin(dist * 12.566 - time * 4.0) * 0.05, 0);
+            
+        default:
+            return float3(0, 0, 0);
+    }
+}
+
+// Evaluate mathematical color
+float4 EvaluateMathematicalColor(ProceduralSurfaceBuffer surface, float u, float v, float time)
+{
+    uint colorData = surface.color_data.x;
+    
+    uint eqn_r = (colorData >> 0) & 0xFF;
+    uint param_r = (colorData >> 8) & 0xFF;
+    uint eqn_g = (colorData >> 16) & 0xFF;
+    uint param_g = (colorData >> 24) & 0xFF;
+    
+    uint colorData2 = surface.color_data.y;
+    uint eqn_b = (colorData2 >> 0) & 0xFF;
+    uint param_b = (colorData2 >> 8) & 0xFF;
+    
+    float r = EvaluateColorChannel(eqn_r, param_r, u, v, time);
+    float g = EvaluateColorChannel(eqn_g, param_g, u, v, time);
+    float b = EvaluateColorChannel(eqn_b, param_b, u, v, time);
+    
+    return float4(r, g, b, 1.0);
+}
+
+float EvaluateColorChannel(uint equation, uint param, float u, float v, float time)
+{
+    float paramFloat = param / 255.0;
+    
+    switch (equation)
+    {
+        case 0: return paramFloat; // Constant
+        case 1: return paramFloat * u; // Linear U
+        case 2: return paramFloat * v; // Linear V
+        case 3: return paramFloat * u * v; // Bilinear
+        case 4: return paramFloat * (0.5 + 0.5 * sin(u * 6.283 + time * 3.1416)); // Animated sine
+        case 5: return paramFloat * (0.5 + 0.5 * cos(v * 6.283 + time * 3.1416)); // Animated cosine
+        default: return paramFloat;
+    }
+}
+
+[numthreads(64,1,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    uint totalPoints = _SurfaceCount * _PointsPerSurface;
+    if (id.x >= totalPoints) return;
+    
+    uint surfaceIndex = id.x / _PointsPerSurface;
+    uint pointIndex = id.x % _PointsPerSurface;
+    
+    ProceduralSurfaceBuffer surface = _SurfaceBuffer[surfaceIndex];
+    
+    // Calculate UV coordinates for this point
+    uint pointsPerRow = sqrt(_PointsPerSurface);
+    uint row = pointIndex / pointsPerRow;
+    uint col = pointIndex % pointsPerRow;
+    
+    float u = (pointsPerRow > 1) ? (float)col / (pointsPerRow - 1) : 0.5;
+    float v = (pointsPerRow > 1) ? (float)row / (pointsPerRow - 1) : 0.5;
+    
+    // Get surface corner positions
+    float3 pos0 = DecodeAnchorPosition(_AnchorBuffer[surface.anchor_point_indices.x].position_data[0]);
+    float3 pos1 = DecodeAnchorPosition(_AnchorBuffer[surface.anchor_point_indices.y].position_data[0]);
+    float3 pos2 = DecodeAnchorPosition(_AnchorBuffer[surface.anchor_point_indices.z].position_data[0]);
+    float3 pos3 = DecodeAnchorPosition(_AnchorBuffer[surface.anchor_point_indices.w].position_data[0]);
+    
+    // Bilinear interpolation
+    float3 top = lerp(pos0, pos1, u);
+    float3 bottom = lerp(pos3, pos2, u);
+    float3 basePosition = lerp(top, bottom, v);
+    
+    // Apply surface equation
+    float3 deformation = EvaluateSurfaceEquation(surface, u, v, _AnimationTime);
+    float3 finalPosition = basePosition + deformation;
+    
+    // Transform to world space
+    finalPosition = mul(_ObjectToWorld, float4(finalPosition, 1.0)).xyz;
+    
+    // Evaluate color
+    float4 color = EvaluateMathematicalColor(surface, u, v, _AnimationTime);
+    
+    // Calculate normal (simplified)
+    float3 normal = float3(0, 1, 0); // Could be improved with proper surface derivatives
+    
+    // Write outputs
+    _OutputPoints[id.x] = finalPosition;
+    _OutputColors[id.x] = color;
+    _OutputNormals[id.x] = normal;
+}

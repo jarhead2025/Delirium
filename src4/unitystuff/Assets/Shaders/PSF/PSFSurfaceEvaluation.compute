@@ -1,0 +1,288 @@
+// PSF Surface Evaluation Compute Shader
+// Evaluates procedural surfaces on GPU
+// Place this file at: Assets/Resources/PSF/Shaders/PSFSurfaceEvaluation.compute
+
+#pragma kernel CSMain
+
+// Thread group size
+#define THREAD_GROUP_SIZE 64
+
+// PSF data structures (must match C# structs exactly - 64 bytes each)
+struct ProceduralSurfaceBuffer
+{
+    uint4 anchor_point_indices;      // 4 x uint16 = 8 bytes (packed as 2 x uint32)
+    uint surface_definition_index;   // 2 bytes (packed)
+    uint padding1;                   // 2 bytes padding
+    float4 eqn_params0;              // 4 x float = 16 bytes
+    float4 eqn_params1;              // 4 x float = 16 bytes (total 8 params)
+    uint4 surface_properties;        // 16 bytes (packed surface properties)
+};
+
+struct AnchorPointBuffer
+{
+    uint bone_index;                 // 4 bytes
+    uint4 connectivity;              // 16 bytes (packed connectivity data)
+    uint4 curve_data;                // 16 bytes (packed curve data)
+    uint4 position_data;             // 16 bytes (packed position and delta)
+    uint4 material_data;             // 12 bytes (packed material properties + padding)
+};
+
+// Input buffers
+StructuredBuffer<ProceduralSurfaceBuffer> _SurfaceBuffer;
+StructuredBuffer<AnchorPointBuffer> _AnchorBuffer;
+StructuredBuffer<float4x4> _BoneMatrixBuffer;
+StructuredBuffer<float> _ParameterBuffer;
+
+// Output buffers
+RWStructuredBuffer<float3> _PointBuffer;
+RWStructuredBuffer<float3> _NormalBuffer;
+
+// Shader parameters
+float _AnimationTime;
+float _Time;
+int _LODLevel;
+int _PointsPerSurface;
+int _SurfaceCount;
+float4x4 _ObjectToWorld;
+
+// Utility functions
+float3 DecodeAnchorPosition(uint4 positionData)
+{
+    // Extract packed position data
+    uint x = (positionData.x & 0xFFFF);
+    uint y = (positionData.x >> 16);
+    uint z = (positionData.y & 0xFFFF);
+    
+    // Convert from uint16 to normalized float3
+    float3 pos;
+    pos.x = ((float)x - 32768.0) / 32768.0 * 1.8;
+    pos.y = ((float)y - 32768.0) / 32768.0 * 1.8;
+    pos.z = ((float)z - 32768.0) / 32768.0 * 1.8;
+    
+    return pos;
+}
+
+float3 DecodeAnchorNormal(uint packedNormal)
+{
+    // Extract packed normal (3 bytes in uint)
+    uint nx = (packedNormal & 0xFF);
+    uint ny = ((packedNormal >> 8) & 0xFF);
+    uint nz = ((packedNormal >> 16) & 0xFF);
+    
+    float3 normal;
+    normal.x = ((float)nx - 127.0) / 127.0;
+    normal.y = ((float)ny - 127.0) / 127.0;
+    normal.z = ((float)nz - 127.0) / 127.0;
+    
+    return normalize(normal);
+}
+
+// Surface equation evaluation
+float3 EvaluateSurfaceEquation(ProceduralSurfaceBuffer surface, float u, float v, float time)
+{
+    uint surfaceType = (surface.surface_properties.x & 0xFF);
+    float4 params0 = surface.eqn_params0;
+    float4 params1 = surface.eqn_params1;
+    
+    float3 displacement = float3(0, 0, 0);
+    
+    switch (surfaceType)
+    {
+        case 0: // Plane
+            displacement = float3(0, 0, 0);
+            break;
+            
+        case 1: // Sine wave
+            {
+                float frequency = params0.x;
+                float amplitude = params0.y;
+                float phase = params0.z;
+                float wave = sin(u * frequency * 6.28318 + time * 6.28318 + phase) * amplitude;
+                displacement = float3(0, wave * 0.1, 0);
+            }
+            break;
+            
+        case 2: // Bezier patch
+            {
+                float height = params0.x * u * v + params0.y * (1.0 - u) * v + params0.z * u * (1.0 - v);
+                displacement = float3(0, height * 0.2, 0);
+            }
+            break;
+            
+        case 3: // Ripple effect
+            {
+                float frequency = params0.x;
+                float amplitude = params0.y;
+                float decay = params0.z;
+                float distance = sqrt(u * u + v * v);
+                float ripple = sin(distance * frequency * 6.28318 - time * 12.56636) * amplitude * exp(-distance * decay);
+                displacement = float3(0, ripple * 0.05, 0);
+            }
+            break;
+            
+        case 4: // Cylinder
+            {
+                float radius = params0.x;
+                float height = params0.y;
+                float angle = u * 6.28318;
+                displacement = float3(cos(angle) * radius, v * height, sin(angle) * radius);
+            }
+            break;
+            
+        case 5: // Sphere
+            {
+                float radius = params0.x;
+                float theta = u * 6.28318;
+                float phi = v * 3.14159;
+                displacement = float3(
+                    sin(phi) * cos(theta) * radius,
+                    cos(phi) * radius,
+                    sin(phi) * sin(theta) * radius
+                );
+            }
+            break;
+            
+        case 6: // Torus
+            {
+                float majorRadius = params0.x;
+                float minorRadius = params0.y;
+                float u_angle = u * 6.28318;
+                float v_angle = v * 6.28318;
+                displacement = float3(
+                    (majorRadius + minorRadius * cos(v_angle)) * cos(u_angle),
+                    minorRadius * sin(v_angle),
+                    (majorRadius + minorRadius * cos(v_angle)) * sin(u_angle)
+                );
+            }
+            break;
+            
+        case 7: // Noise-based displacement
+            {
+                float scale = params0.x;
+                float amplitude = params0.y;
+                // Simple pseudo-noise function
+                float noise = sin(u * scale * 13.7) * cos(v * scale * 17.3) * sin(time * 2.0);
+                displacement = float3(0, noise * amplitude * 0.1, 0);
+            }
+            break;
+            
+        default:
+            displacement = float3(0, 0, 0);
+            break;
+    }
+    
+    return displacement;
+}
+
+// Calculate surface normal using finite differences
+float3 CalculateSurfaceNormal(ProceduralSurfaceBuffer surface, float u, float v, float time, float epsilon = 0.01)
+{
+    float3 p = EvaluateSurfaceEquation(surface, u, v, time);
+    float3 pu = EvaluateSurfaceEquation(surface, u + epsilon, v, time);
+    float3 pv = EvaluateSurfaceEquation(surface, u, v + epsilon, time);
+    
+    float3 du = (pu - p) / epsilon;
+    float3 dv = (pv - p) / epsilon;
+    
+    float3 normal = normalize(cross(du, dv));
+    
+    // Fallback to up vector if normal is degenerate
+    if (length(normal) < 0.1)
+        normal = float3(0, 1, 0);
+    
+    return normal;
+}
+
+// Apply bone animation to anchor point
+float3 ApplyBoneAnimation(float3 anchorPos, uint boneIndex, float animationTime)
+{
+    if (boneIndex >= (uint)_BoneMatrixBuffer.Length)
+        return anchorPos;
+    
+    float4x4 boneMatrix = _BoneMatrixBuffer[boneIndex];
+    
+    // Apply bone transformation
+    float4 worldPos = mul(boneMatrix, float4(anchorPos, 1.0));
+    
+    return worldPos.xyz;
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    uint pointIndex = id.x;
+    
+    // Check bounds
+    if (pointIndex >= (uint)(_SurfaceCount * _PointsPerSurface))
+        return;
+    
+    // Calculate which surface and which point within surface
+    uint surfaceIndex = pointIndex / (uint)_PointsPerSurface;
+    uint pointInSurface = pointIndex % (uint)_PointsPerSurface;
+    
+    if (surfaceIndex >= (uint)_SurfaceCount)
+        return;
+    
+    // Get surface data
+    ProceduralSurfaceBuffer surface = _SurfaceBuffer[surfaceIndex];
+    
+    // Calculate UV coordinates for this point
+    uint pointsPerRow = (uint)sqrt((float)_PointsPerSurface);
+    uint row = pointInSurface / pointsPerRow;
+    uint col = pointInSurface % pointsPerRow;
+    
+    float u = (float)col / (float)(pointsPerRow - 1);
+    float v = (float)row / (float)(pointsPerRow - 1);
+    
+    // Clamp UV to [0,1]
+    u = clamp(u, 0.0, 1.0);
+    v = clamp(v, 0.0, 1.0);
+    
+    // Get anchor positions (extract from packed data)
+    float3 anchors[4];
+    
+    // Extract anchor indices from packed data
+    uint anchor0 = (surface.anchor_point_indices.x & 0xFFFF);
+    uint anchor1 = (surface.anchor_point_indices.x >> 16);
+    uint anchor2 = (surface.anchor_point_indices.y & 0xFFFF);
+    uint anchor3 = (surface.anchor_point_indices.y >> 16);
+    
+    // Get anchor positions
+    if (anchor0 < (uint)_AnchorBuffer.Length)
+    {
+        AnchorPointBuffer anchor = _AnchorBuffer[anchor0];
+        anchors[0] = DecodeAnchorPosition(anchor.position_data);
+        
+        // Apply bone animation if enabled
+        if (anchor.bone_index != 0xFFFFFFFF)
+        {
+            anchors[0] = ApplyBoneAnimation(anchors[0], anchor.bone_index, _AnimationTime);
+        }
+    }
+    else
+    {
+        anchors[0] = float3(0, 0, 0);
+    }
+    
+    if (anchor1 < (uint)_AnchorBuffer.Length)
+    {
+        AnchorPointBuffer anchor = _AnchorBuffer[anchor1];
+        anchors[1] = DecodeAnchorPosition(anchor.position_data);
+        
+        if (anchor.bone_index != 0xFFFFFFFF)
+        {
+            anchors[1] = ApplyBoneAnimation(anchors[1], anchor.bone_index, _AnimationTime);
+        }
+    }
+    else
+    {
+        anchors[1] = float3(1, 0, 0);
+    }
+    
+    if (anchor2 < (uint)_AnchorBuffer.Length)
+    {
+        AnchorPointBuffer anchor = _AnchorBuffer[anchor2];
+        anchors[2] = DecodeAnchorPosition(anchor.position_data);}
+    
+}
+    
