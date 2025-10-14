@@ -83,4 +83,4 @@ afaik, analog computation elements could do more complex  evaluations faster for
 
 
 
-
+files: SRC 1 through 4 are just initial mumble and stumble to see how far this could go and contextualize the line of thought, the blender addons are where the real deal is at
