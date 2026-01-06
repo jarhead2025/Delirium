@@ -1,0 +1,7 @@
+/home/josias/Desktop/Delirium/Build/CMakeFiles/delirium.dir
+/home/josias/Desktop/Delirium/Build/CMakeFiles/edit_cache.dir
+/home/josias/Desktop/Delirium/Build/CMakeFiles/rebuild_cache.dir
+/home/josias/Desktop/Delirium/Build/CMakeFiles/list_install_components.dir
+/home/josias/Desktop/Delirium/Build/CMakeFiles/install.dir
+/home/josias/Desktop/Delirium/Build/CMakeFiles/install/local.dir
+/home/josias/Desktop/Delirium/Build/CMakeFiles/install/strip.dir
