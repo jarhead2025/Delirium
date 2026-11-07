@@ -1,3 +1,6 @@
+
+
+
 # Delirium
 some interesting experiments regarding 3d object coding, hopefully turns out useful.
 
@@ -80,7 +83,7 @@ THINGS THAT COULD POSSIBLY WORK REALLY WELL WITH THIS (mostly curiosity for now)
 
 afaik, analog computation elements could do more complex  evaluations faster for a given set of equation rules and changing the parameters dynamically, just fruit for thought, nothing else.
 
-
+adendum 2026 november - currently trying to redevelop an experimental engine, some things worked some things didnt, but the core idea of using math is still there , only changes were what rendering method was the best.
 
 
 files: SRC 1 through 4 are just initial mumble and stumble to see how far this could go and contextualize the line of thought, the blender addons are where the real deal is at
